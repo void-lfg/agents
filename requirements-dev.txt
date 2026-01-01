@@ -1,0 +1,15 @@
+-r requirements.txt
+
+# ============== DEVELOPMENT TOOLS ==============
+watchdog==4.0.0
+ipdb==0.13.13
+rich==13.7.0
+
+# ============== TYPE CHECKING ==============
+types-redis==4.6.0.20240125
+types-requests==2.31.0.20240125
+
+# ============== DOCUMENTATION ==============
+mkdocs==1.5.3
+mkdocs-material==9.5.9
+mkdocstrings[python]==0.24.0
