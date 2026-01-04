@@ -23,6 +23,12 @@ py-clob-client==1.5.0
 # Z.ai GLM-4.7 (using httpx for API calls)
 httpx[http2]==0.27.0
 
+# Cloud Storage (R2/S3)
+boto3==1.34.97
+
+# pgvector for semantic search (Neon Postgres)
+# (pgvector is a Postgres extension, no Python package needed)
+
 # ============== DATA VALIDATION ==============
 pydantic==2.6.1
 pydantic-settings==2.1.0
