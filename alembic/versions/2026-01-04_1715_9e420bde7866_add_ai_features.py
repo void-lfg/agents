@@ -45,7 +45,7 @@ def upgrade() -> None:
         sa.Column('market_id', sa.String(length=100), nullable=True),
         sa.Column('sentiment_score', sa.Numeric(precision=5, scale=4), nullable=True),
         sa.Column('public_metrics', sa.JSON(), nullable=True),
-        sa.Column('metadata', sa.JSON(), nullable=True),
+        sa.Column('extra_data', sa.JSON(), nullable=True),
         sa.PrimaryKeyConstraint('id'),
         sa.UniqueConstraint('tweet_id')
     )
@@ -67,7 +67,7 @@ def upgrade() -> None:
         sa.Column('collected_at', sa.TIMESTAMP(timezone=True), server_default=sa.text('NOW()'), nullable=False),
         sa.Column('r2_url', sa.String(length=1000), nullable=True),
         sa.Column('archived_at', sa.TIMESTAMP(timezone=True), nullable=True),
-        sa.Column('metadata', sa.JSON(), nullable=True),
+        sa.Column('extra_data', sa.JSON(), nullable=True),
         sa.PrimaryKeyConstraint('id')
     )
     op.create_index('idx_knowledge_market', 'market_knowledge', ['market_id'])
@@ -84,7 +84,7 @@ def upgrade() -> None:
         sa.Column('score', sa.Numeric(precision=5, scale=4), nullable=False),
         sa.Column('confidence', sa.Numeric(precision=5, scale=4), nullable=True),
         sa.Column('analyzed_at', sa.TIMESTAMP(timezone=True), server_default=sa.text('NOW()'), nullable=False),
-        sa.Column('metadata', sa.JSON(), nullable=True),
+        sa.Column('extra_data', sa.JSON(), nullable=True),
         sa.PrimaryKeyConstraint('id')
     )
     op.create_index('idx_sentiment_entity', 'sentiment_scores', ['entity_id', 'entity_type'])

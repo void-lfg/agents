@@ -28,6 +28,7 @@ from void.messaging.events import EventType
 from void.ai.chat_service import ChatService
 from void.data.knowledge.service import KnowledgeService
 from void.data.feeds.twitter_collector import TwitterCollector
+from void.tasks.scheduler import get_scheduler
 from sqlalchemy import select, func
 from void.config import config
 import structlog
@@ -49,6 +50,7 @@ class VoidBot:
         self.config = config
         self.application: Optional[Application] = None
         self.event_bus: Optional[EventBus] = None
+        self.scheduler = get_scheduler()
 
     async def is_authorized(self, user_id: int) -> bool:
         """Check if user is authorized."""
@@ -103,6 +105,13 @@ class VoidBot:
 /menu - Interactive management menu
 /help - Show this message
 
+*🤖 AI Assistant (NEW!):*
+/ask <question> - Ask AI anything about your portfolio
+/research <market_id> - AI-powered market research
+/trends - View Twitter trends
+/news - Latest market news
+💡 Or just type any question directly!
+
 *📊 Monitoring:*
 /status - System status and stats
 /portfolio - Account balances and value
@@ -134,6 +143,7 @@ class VoidBot:
 /about - About VOID
 
 💡 Use /menu for easy navigation!
+💡 Try typing "What's my portfolio status?" directly!
 """
 
         await update.message.reply_text(help_text)
@@ -2009,6 +2019,257 @@ We hope you saved your private key!
 
         struct_logger.info("telegram_error_notification", message=message)
 
+    # ============== AI Chat Commands ==============
+
+    async def ai_chat_handler(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle all non-command messages with AI chat."""
+        user_id = update.effective_user.id
+
+        logger.info(f"[AI Chat] Received message from user {user_id}")
+
+        if not await self.is_authorized(user_id):
+            logger.warning(f"[AI Chat] User {user_id} not authorized")
+            return
+
+        if not config.ai.chat_enabled:
+            logger.warning("[AI Chat] Feature disabled in config")
+            await update.message.reply_text("⚠️ AI chat feature is currently disabled.")
+            return
+
+        user_message = update.message.text
+
+        if not user_message or len(user_message.strip()) == 0:
+            logger.warning("[AI Chat] Empty message received")
+            return
+
+        logger.info(f"[AI Chat] Processing message: {user_message[:50]}...")
+
+        try:
+            async with async_session_maker() as db:
+                chat_service = ChatService(db)
+
+                # Send typing action
+                await update.message.chat.send_action("typing")
+
+                # Get AI response
+                logger.info("[AI Chat] Calling chat service...")
+                response = await chat_service.chat(user_id, user_message)
+
+                logger.info(f"[AI Chat] Got response: {response[:100]}...")
+
+                # Send response (truncate if too long for Telegram)
+                max_length = 4000  # Telegram message limit
+                if len(response) > max_length:
+                    response = response[:max_length-3] + "..."
+                    logger.warning(f"[AI Chat] Response truncated to {max_length} chars")
+
+                # Send as plain text to avoid Markdown parsing errors with AI-generated content
+                await update.message.reply_text(response)
+                logger.info("[AI Chat] Response sent successfully")
+
+        except Exception as e:
+            logger.error(f"[AI Chat] Error: {e}", exc_info=True)
+            await update.message.reply_text(
+                f"⚠️ Sorry, I encountered an error: {str(e)[:100]}"
+            )
+
+    async def ask_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle /ask command - explicit AI question."""
+        user_id = update.effective_user.id
+
+        if not await self.is_authorized(user_id):
+            await update.message.reply_text("⛔ Not authorized")
+            return
+
+        if not config.ai.chat_enabled:
+            await update.message.reply_text("⚠️ AI chat feature is currently disabled.")
+            return
+
+        # Get question from arguments
+        if not context.args or len(context.args) == 0:
+            await update.message.reply_text(
+                "❓ *Usage:* /ask <your question>\n\n"
+                "Example: /ask What's my current portfolio status?",
+                parse_mode="Markdown"
+            )
+            return
+
+        question = " ".join(context.args)
+
+        try:
+            async with async_session_maker() as db:
+                chat_service = ChatService(db)
+
+                await update.message.chat.send_action("typing")
+
+                response = await chat_service.chat(user_id, question)
+
+                if len(response) > 4000:
+                    response = response[:4000-3] + "..."
+
+                # Send as plain text to avoid Markdown parsing errors
+                await update.message.reply_text(response)
+
+        except Exception as e:
+            logger.error(f"Ask command error: {e}", exc_info=True)
+            await update.message.reply_text(f"❌ Error: {str(e)[:100]}")
+
+    async def research_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle /research command - research a specific market."""
+        user_id = update.effective_user.id
+
+        if not await self.is_authorized(user_id):
+            await update.message.reply_text("⛔ Not authorized")
+            return
+
+        # Get market ID from arguments
+        if not context.args or len(context.args) == 0:
+            await update.message.reply_text(
+                "🔬 *Usage:* /research <market_id>\n\n"
+                "Example: /research 0x1234abcd...\n\n"
+                "Researches the market and provides AI analysis.",
+                parse_mode="Markdown"
+            )
+            return
+
+        market_id = context.args[0]
+
+        try:
+            async with async_session_maker() as db:
+                # Check if market exists
+                market = await db.get(Market, market_id)
+                if not market:
+                    await update.message.reply_text(
+                        f"❌ Market `{market_id[:10]}...` not found in database.",
+                        parse_mode="Markdown"
+                    )
+                    return
+
+                await update.message.chat.send_action("typing")
+
+                # Research market
+                knowledge_service = KnowledgeService(db)
+                results = await knowledge_service.research_market(market_id, force=True)
+
+                # Get AI summary
+                chat_service = ChatService(db)
+                summary = await chat_service.research_market(market_id, user_id)
+
+                response = (
+                    f"🔬 Market Research Complete\n\n"
+                    f"Market: {market.question[:80]}...\n\n"
+                    f"📊 Results:\n"
+                    f"• Tweets collected: {results.get('tweets_collected', 0)}\n"
+                    f"• Sentiment: {results.get('sentiment', {}).get('avg_score', 'N/A')}\n"
+                    f"• Knowledge entries: {results.get('knowledge_created', 0)}\n\n"
+                    f"📝 AI Analysis:\n{summary}\n\n"
+                    f"⏰ Researched at: {results.get('started_at', 'N/A')}"
+                )
+
+                if len(response) > 4000:
+                    response = response[:4000-3] + "..."
+
+                # Send as plain text to avoid Markdown parsing errors
+                await update.message.reply_text(response)
+
+        except Exception as e:
+            logger.error(f"Research command error: {e}", exc_info=True)
+            await update.message.reply_text(f"❌ Error: {str(e)[:100]}")
+
+    async def trends_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle /trends command - show Twitter trends."""
+        user_id = update.effective_user.id
+
+        if not await self.is_authorized(user_id):
+            await update.message.reply_text("⛔ Not authorized")
+            return
+
+        try:
+            async with async_session_maker() as db:
+                from void.data.feeds.twitter_client import TwitterClient
+
+                twitter_client = TwitterClient()
+                await update.message.chat.send_action("typing")
+
+                # Get trends
+                trends = await twitter_client.get_trends()
+
+                if not trends:
+                    await update.message.reply_text(
+                        "📊 No trending topics available right now."
+                    )
+                    return
+
+                # Format trends
+                trend_lines = [f"🔹 {trend}" for trend in trends[:10]]
+
+                response = (
+                    "📊 *Twitter Trends*\n\n"
+                    + "\n".join(trend_lines) +
+                    "\n\n💡 *Tip:* Use /ask to learn more about any trend."
+                )
+
+                await update.message.reply_text(response, parse_mode="Markdown")
+
+        except Exception as e:
+            logger.error(f"Trends command error: {e}", exc_info=True)
+            await update.message.reply_text(
+                f"⚠️ Could not fetch trends: {str(e)[:100]}"
+            )
+
+    async def news_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle /news command - show latest news for markets."""
+        user_id = update.effective_user.id
+
+        if not await self.is_authorized(user_id):
+            await update.message.reply_text("⛔ Not authorized")
+            return
+
+        try:
+            async with async_session_maker() as db:
+                from void.data.models import MarketKnowledge
+                from sqlalchemy import select
+
+                await update.message.chat.send_action("typing")
+
+                # Get recent knowledge entries (news type)
+                result = await db.execute(
+                    select(MarketKnowledge)
+                    .where(MarketKnowledge.content_type == "news")
+                    .order_by(MarketKnowledge.collected_at.desc())
+                    .limit(10)
+                )
+                news_items = result.scalars().all()
+
+                if not news_items:
+                    await update.message.reply_text(
+                        "📰 No recent news available. "
+                        "Use /research to collect news for markets."
+                    )
+                    return
+
+                # Format news
+                news_lines = []
+                for item in news_items[:5]:
+                    title = item.title or item.summary[:80] if item.summary else "No title"
+                    news_lines.append(
+                        f"📰 *{title[:60]}...*\n"
+                        f"   Market: `{item.market_id[:10]}...`\n"
+                        f"   Time: {item.collected_at.strftime('%H:%M')}\n"
+                    )
+
+                response = (
+                    "📰 *Latest Market News*\n\n" +
+                    "\n".join(news_lines) +
+                    f"\n💡 Total news entries: {len(news_items)}"
+                )
+
+                await update.message.reply_text(response, parse_mode="Markdown")
+
+        except Exception as e:
+            logger.error(f"News command error: {e}", exc_info=True)
+            await update.message.reply_text(f"❌ Error: {str(e)[:100]}")
+
     # ============== Bot Lifecycle ==============
 
     def setup_handlers(self):
@@ -2037,6 +2298,12 @@ We hope you saved your private key!
         self.application.add_handler(CommandHandler("create_agent", self.create_agent))
         self.application.add_handler(CommandHandler("sync", self.sync_balances))
 
+        # AI Chat commands
+        self.application.add_handler(CommandHandler("ask", self.ask_command))
+        self.application.add_handler(CommandHandler("research", self.research_command))
+        self.application.add_handler(CommandHandler("trends", self.trends_command))
+        self.application.add_handler(CommandHandler("news", self.news_command))
+
         # Admin commands
         self.application.add_handler(CommandHandler("start_agent", self.start_agent))
         self.application.add_handler(CommandHandler("stop_agent", self.stop_agent))
@@ -2044,6 +2311,11 @@ We hope you saved your private key!
         self.application.add_handler(CommandHandler("close_position", self.close_position))
         self.application.add_handler(CommandHandler("deposit", self.deposit))
         self.application.add_handler(CommandHandler("withdraw", self.withdraw))
+
+        # AI Chat message handler (catch-all for non-command messages)
+        self.application.add_handler(
+            MessageHandler(filters.TEXT & ~filters.COMMAND, self.ai_chat_handler)
+        )
 
         # Callback handlers
         self.application.add_handler(CallbackQueryHandler(self.button_callback, pattern='^(start|stop)_'))
@@ -2073,6 +2345,10 @@ We hope you saved your private key!
                 BotCommand("positions", "📈 Open positions"),
                 BotCommand("history", "📜 Trading history"),
                 BotCommand("stats", "📊 Performance stats"),
+                BotCommand("ask", "🤖 Ask AI anything"),
+                BotCommand("research", "🔬 Research market"),
+                BotCommand("trends", "📊 Twitter trends"),
+                BotCommand("news", "📰 Market news"),
                 BotCommand("help", "❓ Help & commands"),
             ]
 
@@ -2100,10 +2376,18 @@ We hope you saved your private key!
 
         await self.application.updater.start_polling(drop_pending_updates=True)
 
+        # Start background task scheduler
+        logger.info("🔄 Starting background task scheduler...")
+        await self.scheduler.start()
+
         logger.info("🤖 VOID Bot started polling")
 
     async def stop(self):
         """Stop bot."""
+        # Stop background scheduler first
+        logger.info("🔄 Stopping background task scheduler...")
+        await self.scheduler.stop()
+
         if self.application:
             await self.application.updater.stop()
             await self.application.stop()
@@ -2121,5 +2405,9 @@ We hope you saved your private key!
 
         # Set webhook
         await self.application.bot.set_webhook(webhook_url)
+
+        # Start background task scheduler
+        logger.info("🔄 Starting background task scheduler...")
+        await self.scheduler.start()
 
         logger.info(f"🤖 VOID Bot started with webhook: {webhook_url}")

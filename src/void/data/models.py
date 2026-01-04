@@ -10,10 +10,10 @@ from uuid import UUID, uuid4
 
 from sqlalchemy import (
     String, Text, Numeric, Boolean, DateTime, ForeignKey,
-    Index, UniqueConstraint, CheckConstraint, JSON
+    Index, UniqueConstraint, CheckConstraint, JSON, BigInteger, Float
 )
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
-from sqlalchemy.dialects.postgresql import UUID as PG_UUID, JSONB, ARRAY
+from sqlalchemy.dialects.postgresql import UUID as PG_UUID, JSONB, ARRAY as PG_ARRAY
 
 
 class Base(DeclarativeBase):
@@ -214,7 +214,7 @@ class Market(Base):
     question: Mapped[str] = mapped_column(Text, nullable=False)
     slug: Mapped[str] = mapped_column(String(200))
     category: Mapped[Optional[str]] = mapped_column(String(100))
-    tags: Mapped[List[str]] = mapped_column(ARRAY(String), default=list)
+    tags: Mapped[List[str]] = mapped_column(PG_ARRAY(String), default=list)
 
     # Token IDs
     yes_token_id: Mapped[str] = mapped_column(String(100), nullable=False)
@@ -468,9 +468,12 @@ class TwitterData(Base):
     # Sentiment
     sentiment_score: Mapped[Optional[Decimal]] = mapped_column(Numeric(5, 4))  # -1.0 to +1.0
 
+    # Vector embedding for semantic search
+    embedding: Mapped[Optional[list[float]]] = mapped_column(PG_ARRAY(Float, dimensions=1536))
+
     # Twitter metadata
     public_metrics: Mapped[Optional[dict]] = mapped_column(JSONB)  # likes, retweets, replies
-    metadata: Mapped[dict] = mapped_column(JSONB, default=dict)
+    extra_data: Mapped[dict] = mapped_column(JSONB, default=dict)  # Additional metadata
 
     __table_args__ = (
         Index("idx_twitter_market", "market_id"),
@@ -506,8 +509,11 @@ class MarketKnowledge(Base):
     # R2 storage
     r2_url: Mapped[Optional[str]] = mapped_column(String(1000))  # URL to archived content in R2
 
+    # Vector embedding for semantic search (pgvector)
+    embedding: Mapped[Optional[list[float]]] = mapped_column(PG_ARRAY(Float, dimensions=1536))  # OpenAI embedding size
+
     # Additional metadata
-    metadata: Mapped[dict] = mapped_column(JSONB, default=dict)
+    extra_data: Mapped[dict] = mapped_column(JSONB, default=dict)
 
     __table_args__ = (
         Index("idx_knowledge_market", "market_id"),
@@ -532,7 +538,7 @@ class SentimentScore(Base):
 
     # Analysis metadata
     analyzed_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
-    metadata: Mapped[dict] = mapped_column(JSONB, default=dict)
+    extra_data: Mapped[dict] = mapped_column(JSONB, default=dict)
 
     __table_args__ = (
         Index("idx_sentiment_entity", "entity_id", "entity_type"),

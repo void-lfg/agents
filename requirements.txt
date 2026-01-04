@@ -20,8 +20,14 @@ eth-account==0.13.0
 py-clob-client==1.5.0
 
 # ============== AI/ML ==============
-# Z.ai GLM-4.7 (using httpx for API calls)
-httpx[http2]==0.27.0
+# Groq Cloud (Primary LLM - Free Tier)
+groq==1.0.0
+
+# Future: DeepSeek V3
+# deepseek-openai==1.0.0
+
+# Future: OpenAI (Fallback)
+# openai>=1.0.0
 
 # Cloud Storage (R2/S3)
 boto3==1.34.97
@@ -74,3 +80,4 @@ black==24.1.1
 ruff==0.2.1
 mypy==1.8.0
 ipython==8.20.0
+zhipuai==2.1.5.20250825

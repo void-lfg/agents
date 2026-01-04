@@ -2,13 +2,15 @@
 Main AI chat service for VOID.
 
 Orchestrates LLM calls, context building, and conversation management.
+Provider-agnostic - supports Groq, DeepSeek, OpenAI through factory pattern.
 """
 
+import re
 from datetime import datetime
 from typing import Optional, Dict, Any
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from void.ai.llm_client import ZAIClient
+from void.ai.llm_factory import create_llm_client
 from void.ai.conversation_manager import ConversationManager
 from void.ai.context_builder import ContextBuilder
 from void.ai.prompt_templates import PromptTemplates
@@ -19,12 +21,49 @@ import structlog
 logger = structlog.get_logger()
 
 
+def strip_markdown(text: str) -> str:
+    """
+    Remove Markdown formatting from text for Telegram plain text messages.
+
+    Args:
+        text: Text with Markdown formatting
+
+    Returns:
+        Plain text without Markdown
+    """
+    # Remove bold (**text** or __text__)
+    text = re.sub(r'\*\*(.*?)\*\*', r'\1', text)
+    text = re.sub(r'__(.*?)__', r'\1', text)
+
+    # Remove italic (*text* or _text_)
+    text = re.sub(r'\*(.*?)\*', r'\1', text)
+    text = re.sub(r'_(?!.*_)(.*?)_', r'\1', text)
+
+    # Remove headers (###, ##, #)
+    text = re.sub(r'^#+\s+', '', text, flags=re.MULTILINE)
+
+    # Remove code blocks (```text```)
+    text = re.sub(r'```.*?\n(.*?)```', r'\1', text, flags=re.DOTALL)
+
+    # Remove inline code (`text`)
+    text = re.sub(r'`(.*?)`', r'\1', text)
+
+    # Remove strikethrough (~~text~~)
+    text = re.sub(r'~~(.*?)~~', r'\1', text)
+
+    # Clean up extra whitespace
+    text = re.sub(r'\n{3,}', '\n\n', text)  # Max 2 consecutive newlines
+    text = text.strip()
+
+    return text
+
+
 class ChatService:
     """Main chat service coordinating all AI features."""
 
     def __init__(self, db: AsyncSession):
         self.db = db
-        self.llm = ZAIClient()
+        self.llm = create_llm_client()
         self.conv_manager = ConversationManager(db)
         self.context_builder = ContextBuilder(db)
 
@@ -89,7 +128,10 @@ class ChatService:
                     message, system_prompt, context, history
                 )
 
-            # 5. Save to conversation history
+            # 5. Strip Markdown formatting for Telegram plain text
+            response = strip_markdown(response)
+
+            # 6. Save to conversation history
             await self.conv_manager.add_message(user_id, "user", message)
             await self.conv_manager.add_message(user_id, "assistant", response)
 
@@ -102,7 +144,36 @@ class ChatService:
                 error=str(e),
                 exc_info=True,
             )
-            return f"Sorry, I encountered an error: {str(e)}"
+
+            # VOID-specific friendly error messages
+            error_str = str(e)
+
+            if "429" in error_str or "Too Many Requests" in error_str:
+                return (
+                    "🤖 *VOID AI Assistant*\n\n"
+                    "I'm currently experiencing high demand and can't process your request right now. "
+                    "Please try again in a moment.\n\n"
+                    "In the meantime, you can use these commands:\n"
+                    "• /portfolio - View your portfolio\n"
+                    "• /positions - See open positions\n"
+                    "• /status - Check system status\n"
+                    "• /help - See all commands"
+                )
+            elif "余额不足" in error_str or "balance" in error_str.lower():
+                return (
+                    "🤖 *VOID AI Assistant*\n\n"
+                    "I'm currently unable to access my AI services due to API credit limitations. "
+                    "The VOID trading bot is still fully functional!\n\n"
+                    "You can use these commands:\n"
+                    "• /portfolio - View your portfolio balances\n"
+                    "• /positions - See all open positions\n"
+                    "• /signals - View recent trading signals\n"
+                    "• /agents - Manage trading agents\n"
+                    "• /status - System status\n\n"
+                    "Try again later for AI-powered responses!"
+                )
+            else:
+                return f"⚠️ Sorry, I encountered an error: {error_str[:200]}"
 
     def _extract_market_id(self, message: str, intent: str) -> Optional[str]:
         """
@@ -310,6 +381,9 @@ class ChatService:
         )
 
         response = await self.llm.chat(report)
+
+        # Strip Markdown formatting for Telegram plain text
+        response = strip_markdown(response)
 
         # Update market's last_researched timestamp
         market.last_researched_at = datetime.utcnow()

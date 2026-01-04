@@ -104,19 +104,35 @@ class TradingConfig(BaseSettings):
 
 
 class AIConfig(BaseSettings):
-    """AI services configuration."""
+    """Multi-LLM provider configuration."""
 
     model_config = SettingsConfigDict(env_prefix="AI_", extra="ignore")
 
-    # Existing Z.ai config
-    zai_api_key: SecretStr = Field(..., description="Z.ai API key")
-    zai_model: str = Field(default="glm-4.7", description="Z.ai GLM model")
+    # LLM Provider Selection
+    llm_provider: str = Field(default="groq", description="LLM provider: groq | deepseek | openai")
+
+    # Groq Configuration
+    groq_api_key: SecretStr = Field(default=SecretStr(""), description="Groq API key")
+    groq_model: str = Field(default="llama-3.3-70b-versatile", description="Groq model")
+
+    # DeepSeek Configuration
+    deepseek_api_key: SecretStr = Field(default=SecretStr(""), description="DeepSeek API key")
+    deepseek_model: str = Field(default="deepseek-chat", description="DeepSeek model")
+
+    # OpenAI Configuration
+    openai_api_key: SecretStr = Field(default=SecretStr(""), description="OpenAI API key")
+    openai_model: str = Field(default="gpt-4o-mini", description="OpenAI model")
+
+    # Legacy Z.ai (deprecated, keeping for compatibility)
+    zai_api_key: SecretStr = Field(default=SecretStr(""), description="Z.ai API key (deprecated)")
+    zai_model: str = Field(default="glm-4.7", description="Z.ai GLM model (deprecated)")
+
     confidence_threshold: float = Field(
         default=0.95,
         description="AI confidence threshold"
     )
 
-    # NEW: Chat settings
+    # Chat settings
     chat_enabled: bool = Field(default=True, description="Enable AI chat feature")
     chat_max_history: int = Field(default=10, description="Max conversation history")
     chat_temperature: float = Field(default=0.7, description="Chat temperature (0-1)")

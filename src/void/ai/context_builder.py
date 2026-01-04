@@ -96,7 +96,7 @@ class ContextBuilder:
                 select(Signal)
                 .join(Agent)
                 .where(Agent.account_id == account.id)
-                .order_by(Signal.created_at.desc())
+                .order_by(Signal.detected_at.desc())
                 .limit(5)
             )
             signals = signals_result.scalars().all()

@@ -339,3 +339,26 @@ Proprietary - All rights reserved
 
 **Built by Claude Code with Z.ai GLM-4.7**
 **Date**: January 1, 2026
+
+
+follow UMA for news
+
+
+knowldge base
+- news outside twitter/
+
+polymarket - rules, uma stuff
+
+- db
+- storage - s3
+
+
+- agent | orcale latencyt
+- multiple account
+-wallet - usdc
+
+
+- agent 2 | copy account x poly
+- accounts
+
+
