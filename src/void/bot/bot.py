@@ -20,12 +20,16 @@ from telegram.ext import (
 
 from void.bot.config import TelegramBotConfig
 from void.data.database import async_session_maker
-from void.data.models import Agent, Account, Position, Signal, AgentStatus
+from void.data.models import Agent, Account, Position, Signal, AgentStatus, Market
 from void.accounts.service import AccountService
 from void.agent.orchestrator import AgentOrchestrator
 from void.messaging import EventBus
 from void.messaging.events import EventType
+from void.ai.chat_service import ChatService
+from void.data.knowledge.service import KnowledgeService
+from void.data.feeds.twitter_collector import TwitterCollector
 from sqlalchemy import select, func
+from void.config import config
 import structlog
 
 # Configure logging
