@@ -239,6 +239,13 @@ class Market(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
+    # AI/Knowledge features
+    knowledge_data: Mapped[dict] = mapped_column(JSONB, default=dict)  # Stored knowledge about this market
+    last_researched_at: Mapped[Optional[datetime]] = mapped_column(DateTime)  # Last time AI researched this market
+    sentiment_score: Mapped[Optional[Decimal]] = mapped_column(Numeric(5, 4))  # Overall sentiment (-1.0 to +1.0)
+    twitter_volume: Mapped[int] = mapped_column(default=0)  # Number of tweets collected
+    news_count: Mapped[int] = mapped_column(default=0)  # Number of news articles collected
+
     # Relationships
     signals: Mapped[List["Signal"]] = relationship(back_populates="market")
     orders: Mapped[List["Order"]] = relationship(back_populates="market")
@@ -248,6 +255,8 @@ class Market(Base):
         Index("ix_markets_status", "status"),
         Index("ix_markets_end_date", "end_date"),
         Index("ix_markets_category", "category"),
+        Index("idx_markets_sentiment", "sentiment_score"),
+        Index("idx_markets_researched", "last_researched_at"),
     )
 
 
@@ -421,6 +430,116 @@ class TradeLog(Base):
     )
 
 
+# ============== AI FEATURE MODELS ==============
+
+class ConversationHistory(Base):
+    """Chat conversation history for each user."""
+
+    __tablename__ = "conversation_history"
+
+    id: Mapped[UUID] = mapped_column(PG_UUID(as_uuid=True), primary_key=True, default=uuid4)
+    user_id: Mapped[int] = mapped_column(BigInteger, nullable=False)  # Telegram user ID
+    messages: Mapped[List[dict]] = mapped_column(JSON, default=list)  # List of {role, content, timestamp}
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    __table_args__ = (
+        Index("idx_conv_history_user", "user_id"),
+        Index("idx_conv_history_updated", "updated_at"),
+    )
+
+
+class TwitterData(Base):
+    """Twitter/X data collected for markets."""
+
+    __tablename__ = "twitter_data"
+
+    id: Mapped[UUID] = mapped_column(PG_UUID(as_uuid=True), primary_key=True, default=uuid4)
+    tweet_id: Mapped[str] = mapped_column(String(50), unique=True, nullable=False)
+    content: Mapped[str] = mapped_column(Text, nullable=False)
+    author: Mapped[Optional[str]] = mapped_column(String(100))
+    author_id: Mapped[Optional[str]] = mapped_column(String(50))
+    created_at: Mapped[Optional[datetime]] = mapped_column(DateTime)  # Twitter timestamp
+    collected_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)  # When we collected it
+
+    # Market association
+    market_id: Mapped[Optional[str]] = mapped_column(String(100))  # Polymarket market ID if relevant
+
+    # Sentiment
+    sentiment_score: Mapped[Optional[Decimal]] = mapped_column(Numeric(5, 4))  # -1.0 to +1.0
+
+    # Twitter metadata
+    public_metrics: Mapped[Optional[dict]] = mapped_column(JSONB)  # likes, retweets, replies
+    metadata: Mapped[dict] = mapped_column(JSONB, default=dict)
+
+    __table_args__ = (
+        Index("idx_twitter_market", "market_id"),
+        Index("idx_twitter_collected", "collected_at"),
+        Index("idx_twitter_sentiment", "sentiment_score"),
+    )
+
+
+class MarketKnowledge(Base):
+    """Knowledge base entries for markets."""
+
+    __tablename__ = "market_knowledge"
+
+    id: Mapped[UUID] = mapped_column(PG_UUID(as_uuid=True), primary_key=True, default=uuid4)
+    market_id: Mapped[str] = mapped_column(String(100), nullable=False)
+    content_type: Mapped[str] = mapped_column(String(50), nullable=False)  # twitter, news, analysis
+
+    # Source info
+    source_url: Mapped[Optional[str]] = mapped_column(String(500))
+    title: Mapped[Optional[str]] = mapped_column(String(500))
+
+    # Content
+    summary: Mapped[Optional[str]] = mapped_column(Text)
+    content: Mapped[Optional[str]] = mapped_column(Text)  # Full content (might be archived to R2)
+
+    # Relevance
+    relevance_score: Mapped[Optional[Decimal]] = mapped_column(Numeric(5, 4))  # 0.0 to 1.0
+
+    # Timestamps
+    collected_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    archived_at: Mapped[Optional[datetime]] = mapped_column(DateTime)  # If moved to R2
+
+    # R2 storage
+    r2_url: Mapped[Optional[str]] = mapped_column(String(1000))  # URL to archived content in R2
+
+    # Additional metadata
+    metadata: Mapped[dict] = mapped_column(JSONB, default=dict)
+
+    __table_args__ = (
+        Index("idx_knowledge_market", "market_id"),
+        Index("idx_knowledge_type", "content_type"),
+        Index("idx_knowledge_relevance", "relevance_score"),
+        Index("idx_knowledge_collected", "collected_at"),
+    )
+
+
+class SentimentScore(Base):
+    """Sentiment analysis scores for entities."""
+
+    __tablename__ = "sentiment_scores"
+
+    id: Mapped[UUID] = mapped_column(PG_UUID(as_uuid=True), primary_key=True, default=uuid4)
+    entity_id: Mapped[str] = mapped_column(String(100), nullable=False)  # market ID, tweet ID, etc.
+    entity_type: Mapped[str] = mapped_column(String(50), nullable=False)  # market, tweet, news
+
+    # Sentiment data
+    score: Mapped[Decimal] = mapped_column(Numeric(5, 4), nullable=False)  # -1.0 to +1.0
+    confidence: Mapped[Optional[Decimal]] = mapped_column(Numeric(5, 4))  # 0.0 to 1.0
+
+    # Analysis metadata
+    analyzed_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    metadata: Mapped[dict] = mapped_column(JSONB, default=dict)
+
+    __table_args__ = (
+        Index("idx_sentiment_entity", "entity_id", "entity_type"),
+        Index("idx_sentiment_analyzed", "analyzed_at"),
+    )
+
+
 __all__ = [
     "Base",
     "Account",
@@ -431,6 +550,10 @@ __all__ = [
     "Order",
     "Position",
     "TradeLog",
+    "ConversationHistory",
+    "TwitterData",
+    "MarketKnowledge",
+    "SentimentScore",
     "AccountStatus",
     "AgentStatus",
     "StrategyType",

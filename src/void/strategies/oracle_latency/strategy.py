@@ -12,7 +12,7 @@ Risk: Very low (outcome is already known)
 from dataclasses import dataclass, field
 from datetime import datetime, timezone, timedelta
 from decimal import Decimal
-from typing import List, AsyncIterator, Optional
+from typing import List, AsyncIterator, Optional, Any
 import asyncio
 
 from void.strategies.base import (

@@ -193,5 +193,69 @@ class AccountService:
 
         return account
 
+    async def delete_account(
+        self,
+        account_id: UUID,
+    ) -> None:
+        """
+        Delete an account permanently.
+
+        WARNING: This is irreversible! All account data will be lost.
+        Make sure user has backed up private key before calling this.
+
+        Args:
+            account_id: Account ID to delete
+        """
+        account = await self.get_account(account_id)
+        if not account:
+            raise ValueError(f"Account {account_id} not found")
+
+        # Check for associated agents and delete them first
+        from sqlalchemy import select
+        from void.data.models import Agent
+
+        result = await self.db.execute(
+            select(Agent).where(Agent.account_id == account_id)
+        )
+        agents = result.scalars().all()
+
+        if agents:
+            logger.info(
+                "deleting_associated_agents",
+                account_id=str(account_id),
+                agent_count=len(agents)
+            )
+            for agent in agents:
+                await self.db.delete(agent)
+
+        # Delete positions associated with this account
+        from void.data.models import Position
+        result = await self.db.execute(
+            select(Position).where(Position.account_id == account_id)
+        )
+        positions = result.scalars().all()
+
+        if positions:
+            logger.info(
+                "deleting_associated_positions",
+                account_id=str(account_id),
+                position_count=len(positions)
+            )
+            for position in positions:
+                await self.db.delete(position)
+
+        # Now delete the account
+        await self.repo.delete(account)
+        await self.db.commit()
+
+        logger.info(
+            "account_deleted",
+            account_id=str(account_id),
+            name=account.name,
+            address=account.address,
+            agents_deleted=len(agents),
+            positions_deleted=len(positions),
+        )
+
 
 __all__ = ["AccountService"]

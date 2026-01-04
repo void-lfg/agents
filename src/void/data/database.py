@@ -16,13 +16,29 @@ from void.data.models import Base
 
 
 # Create async engine
+# Parse connect args from URL for asyncpg
+from urllib.parse import urlparse, parse_qs
+db_url = str(config.database.url)
+parsed = urlparse(db_url)
+
+# Extract SSL mode from query params and clean URL
+connect_args = {}
+clean_url = db_url
+if parsed.query:
+    params = parse_qs(parsed.query)
+    if 'sslmode' in params:
+        connect_args['ssl'] = params['sslmode'][0]
+    # Remove query string from URL
+    clean_url = parsed._replace(query='').geturl()
+
 engine: AsyncEngine = create_async_engine(
-    str(config.database.url),
+    clean_url,
     echo=config.database.echo,
     pool_size=config.database.pool_size,
     max_overflow=config.database.max_overflow,
     pool_pre_ping=True,  # Verify connections before using
     pool_recycle=3600,  # Recycle connections after 1 hour
+    connect_args=connect_args if connect_args else None,
 )
 
 # Create async session factory

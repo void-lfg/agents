@@ -1,0 +1,2 @@
+[console_scripts]
+void-admin = void.admin.cli.main:cli

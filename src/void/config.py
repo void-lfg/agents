@@ -3,9 +3,13 @@ Global configuration using Pydantic Settings.
 All secrets loaded from environment variables.
 """
 
+from dotenv import load_dotenv
 from typing import Literal, Optional
 from pydantic import Field, SecretStr, PostgresDsn, RedisDsn
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+# Load .env file
+load_dotenv()
 
 
 class DatabaseConfig(BaseSettings):
@@ -104,12 +108,20 @@ class AIConfig(BaseSettings):
 
     model_config = SettingsConfigDict(env_prefix="AI_", extra="ignore")
 
+    # Existing Z.ai config
     zai_api_key: SecretStr = Field(..., description="Z.ai API key")
     zai_model: str = Field(default="glm-4.7", description="Z.ai GLM model")
     confidence_threshold: float = Field(
         default=0.95,
         description="AI confidence threshold"
     )
+
+    # NEW: Chat settings
+    chat_enabled: bool = Field(default=True, description="Enable AI chat feature")
+    chat_max_history: int = Field(default=10, description="Max conversation history")
+    chat_temperature: float = Field(default=0.7, description="Chat temperature (0-1)")
+    chat_max_tokens: int = Field(default=2000, description="Max tokens per response")
+    chat_timeout_seconds: int = Field(default=10, description="Chat request timeout")
 
 
 class AdminConfig(BaseSettings):
@@ -145,6 +157,55 @@ class MonitoringConfig(BaseSettings):
     grafana_password: str = Field(default="admin", description="Grafana password")
 
 
+class TwitterConfig(BaseSettings):
+    """Twitter/X API configuration."""
+
+    model_config = SettingsConfigDict(env_prefix="TWITTER_", extra="ignore")
+
+    bearer_token: SecretStr = Field(..., description="Twitter bearer token")
+    api_key: SecretStr = Field(..., description="Twitter API key")
+    api_secret: SecretStr = Field(..., description="Twitter API secret")
+
+    # Collection settings
+    collection_interval_minutes: int = Field(default=15, description="Data collection interval")
+    trends_interval_hours: int = Field(default=1, description="Trends monitoring interval")
+    search_max_results: int = Field(default=100, description="Max results per search")
+    sentiment_enabled: bool = Field(default=True, description="Enable sentiment analysis")
+
+
+class R2Config(BaseSettings):
+    """Cloudflare R2 storage configuration."""
+
+    model_config = SettingsConfigDict(env_prefix="R2_", extra="ignore")
+
+    account_id: str = Field(..., description="Cloudflare account ID")
+    access_key_id: str = Field(..., description="R2 access key ID")
+    secret_access_key: SecretStr = Field(..., description="R2 secret access key")
+    bucket_name: str = Field(default="void-v1", description="R2 bucket name")
+    knowledge_base_path: str = Field(
+        default="void-agent-knowledge-base",
+        description="Knowledge base path in bucket"
+    )
+    endpoint: str = Field(
+        default="https://476f3d30838d09d1253b76f0c92c265d.r2.cloudflarestorage.com",
+        description="R2 S3-compatible endpoint"
+    )
+
+
+class KnowledgeConfig(BaseSettings):
+    """Knowledge base configuration."""
+
+    model_config = SettingsConfigDict(env_prefix="KNOWLEDGE_", extra="ignore")
+
+    retention_days: int = Field(default=20, description="Hot storage retention period")
+    archival_enabled: bool = Field(default=True, description="Enable archival to R2")
+    auto_research: bool = Field(default=True, description="Auto-research markets")
+    max_knowledge_per_market: int = Field(
+        default=1000,
+        description="Max knowledge entries per market"
+    )
+
+
 class VoidConfig(BaseSettings):
     """Master configuration aggregating all sub-configs."""
 
@@ -169,6 +230,9 @@ class VoidConfig(BaseSettings):
     admin: AdminConfig = Field(default_factory=AdminConfig)
     encryption: EncryptionConfig = Field(default_factory=EncryptionConfig)
     monitoring: MonitoringConfig = Field(default_factory=MonitoringConfig)
+    twitter: TwitterConfig = Field(default_factory=TwitterConfig)
+    r2: R2Config = Field(default_factory=R2Config)
+    knowledge: KnowledgeConfig = Field(default_factory=KnowledgeConfig)
 
 
 # Global config instance
@@ -186,5 +250,8 @@ __all__ = [
     "AdminConfig",
     "EncryptionConfig",
     "MonitoringConfig",
+    "TwitterConfig",
+    "R2Config",
+    "KnowledgeConfig",
     "config",
 ]
