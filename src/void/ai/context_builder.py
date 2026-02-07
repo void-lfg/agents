@@ -45,14 +45,24 @@ class ContextBuilder:
         """
         context_parts = []
 
-        # Get account info
+        # Get account info - always filter by user_id for security
         if account_id:
-            account = await self.db.get(Account, account_id)
+            # Verify account belongs to this user
+            result = await self.db.execute(
+                select(Account).where(
+                    Account.id == account_id,
+                    Account.telegram_user_id == user_id
+                )
+            )
+            account = result.scalar_one_or_none()
         else:
             # Get user's primary account (first active one)
             result = await self.db.execute(
                 select(Account)
-                .where(Account.status == "active")
+                .where(
+                    Account.telegram_user_id == user_id,
+                    Account.status == "active"
+                )
                 .limit(1)
             )
             account = result.scalar_one_or_none()

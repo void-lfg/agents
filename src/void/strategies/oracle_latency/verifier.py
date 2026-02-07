@@ -1,22 +1,23 @@
 """
-AI-powered outcome verification for Oracle Latency strategy using Z.ai GLM-4.7.
+AI-powered outcome verification for Oracle Latency strategy using Groq LLM.
 """
 
 import asyncio
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from typing import Optional, List
 from enum import Enum
-import httpx
 import structlog
 
 from void.config import config
+from void.ai.groq_client import GroqClient
 
 logger = structlog.get_logger()
 
 
 class VerificationSource(str, Enum):
     """Verification source types."""
-    ZAI = "zai"
+    GROQ = "groq"
     ESPN = "espn"
     BINANCE = "binance"
     MANUAL = "manual"
@@ -36,7 +37,7 @@ class VerificationResult:
 
 class OutcomeVerifier:
     """
-    Verify real-world outcomes using Z.ai GLM-4.7.
+    Verify real-world outcomes using Groq LLM (llama-3.3-70b-versatile).
 
     Confirms that:
     1. The event has actually concluded
@@ -45,9 +46,10 @@ class OutcomeVerifier:
     """
 
     def __init__(self):
-        self.api_key = config.ai.zai_api_key.get_secret_value()
-        self.model = config.ai.zai_model
-        self.api_url = "https://api.z.ai/api/paas/v4/chat/completions"
+        self.groq_client = GroqClient(
+            api_key=config.ai.groq_api_key.get_secret_value(),
+            model=config.ai.groq_model,
+        )
 
     async def verify_outcome(
         self,
@@ -57,7 +59,7 @@ class OutcomeVerifier:
         sources: Optional[List[str]] = None,
     ) -> VerificationResult:
         """
-        Verify outcome using Z.ai GLM-4.7.
+        Verify outcome using Groq LLM.
 
         Args:
             question: Market question
@@ -68,24 +70,13 @@ class OutcomeVerifier:
         Returns:
             Verification result with confidence score
         """
-        # Default to Z.ai
-        if not sources:
-            sources = ["zai"]
-
         try:
-            for source in sources:
-                if source == "zai":
-                    result = await self._verify_with_zai(
-                        question,
-                        predicted_outcome,
-                        market_category,
-                    )
+            result = await self._verify_with_groq(
+                question,
+                predicted_outcome,
+                market_category,
+            )
 
-                # If confidence is high enough, return
-                if result.confidence >= config.ai.confidence_threshold:
-                    return result
-
-            # Return best result
             return result
 
         except Exception as e:
@@ -101,17 +92,17 @@ class OutcomeVerifier:
                 source=VerificationSource.MANUAL,
                 reasoning=f"Verification failed: {str(e)}",
                 raw_data={},
-                verified_at="",
+                verified_at=datetime.now(timezone.utc).isoformat(),
             )
 
-    async def _verify_with_zai(
+    async def _verify_with_groq(
         self,
         question: str,
         predicted_outcome: str,
         market_category: Optional[str] = None,
     ) -> VerificationResult:
         """
-        Verify outcome using Z.ai GLM-4.7.
+        Verify outcome using Groq LLM.
 
         Args:
             question: Market question
@@ -129,68 +120,49 @@ class OutcomeVerifier:
         )
 
         try:
-            # Call Z.ai API
-            async with httpx.AsyncClient(timeout=30.0) as client:
-                response = await client.post(
-                    self.api_url,
-                    headers={
-                        "Authorization": f"Bearer {self.api_key}",
-                        "Content-Type": "application/json",
-                    },
-                    json={
-                        "model": self.model,
-                        "messages": [
-                            {
-                                "role": "system",
-                                "content": "You are an expert at verifying real-world outcomes for prediction markets. Provide accurate, factual answers based on current events.",
-                            },
-                            {
-                                "role": "user",
-                                "content": prompt,
-                            },
-                        ],
-                        "temperature": 0.0,  # Deterministic
-                        "top_p": 0.95,
-                        "max_tokens": 200,
-                        "do_sample": False,  # Synchronous call
-                    },
-                )
+            # Call Groq API
+            messages = [
+                {
+                    "role": "system",
+                    "content": (
+                        "You are an expert at verifying real-world outcomes for prediction markets. "
+                        "Provide accurate, factual answers based on your knowledge. "
+                        "Be conservative with confidence scores - only give high confidence if you are certain."
+                    ),
+                },
+                {
+                    "role": "user",
+                    "content": prompt,
+                },
+            ]
 
-                response.raise_for_status()
-                data = response.json()
-
-                # Parse response
-                content = data["choices"][0]["message"]["content"]
-
-                # Extract confidence and reasoning
-                confidence, reasoning = self._parse_zai_response(content)
-
-                logger.info(
-                    "zai_verification_complete",
-                    question=question[:50],
-                    predicted_outcome=predicted_outcome,
-                    confidence=confidence,
-                )
-
-                return VerificationResult(
-                    predicted_outcome=predicted_outcome,
-                    confidence=confidence,
-                    source=VerificationSource.ZAI,
-                    reasoning=reasoning,
-                    raw_data={"response": content},
-                    verified_at="",
-                )
-
-        except httpx.HTTPStatusError as e:
-            logger.error(
-                "zai_http_error",
-                status_code=e.response.status_code,
-                response=e.response.text,
+            content = await self.groq_client.chat_completion(
+                messages=messages,
+                temperature=0.1,  # Low temperature for factual responses
+                max_tokens=300,
             )
-            raise
+
+            # Extract confidence and reasoning
+            confidence, reasoning = self._parse_response(content)
+
+            logger.info(
+                "groq_verification_complete",
+                question=question[:50],
+                predicted_outcome=predicted_outcome,
+                confidence=confidence,
+            )
+
+            return VerificationResult(
+                predicted_outcome=predicted_outcome,
+                confidence=confidence,
+                source=VerificationSource.GROQ,
+                reasoning=reasoning,
+                raw_data={"response": content},
+                verified_at=datetime.now(timezone.utc).isoformat(),
+            )
 
         except Exception as e:
-            logger.error("zai_verification_error", error=str(e))
+            logger.error("groq_verification_error", error=str(e))
             raise
 
     def _build_verification_prompt(
@@ -199,63 +171,84 @@ class OutcomeVerifier:
         predicted_outcome: str,
         market_category: Optional[str] = None,
     ) -> str:
-        """Build verification prompt for Z.ai GLM-4.7."""
+        """Build verification prompt for Groq LLM."""
+        category_hint = f"\nCategory: {market_category}" if market_category else ""
+
         prompt = f"""I need you to verify the outcome of a prediction market question.
 
-**Market Question:** {question}
+**Market Question:** {question}{category_hint}
 
 **Predicted Outcome:** {predicted_outcome}
 
 **Task:**
-1. Determine if this event has already concluded
-2. Verify if the predicted outcome is correct
+1. Based on your knowledge, determine if this event has already concluded
+2. If concluded, verify if the predicted outcome ({predicted_outcome}) is correct
 3. Assess your confidence level (0.0 to 1.0)
 
 **Requirements:**
-- Base your answer ONLY on confirmed facts and official results
-- If the event hasn't concluded yet, say "NOT CONCLUDED"
-- Provide your confidence as a decimal between 0.0 and 1.0
-- Be conservative - if you're not 100% sure, lower your confidence
+- Base your answer ONLY on confirmed facts and official results you know about
+- If the event hasn't concluded yet, confidence should be 0.0
+- If you're uncertain about the outcome, lower your confidence accordingly
+- Be conservative - only give confidence > 0.9 if you are absolutely certain
 
-**Response Format:**
+**Response Format (follow this exactly):**
+CONCLUDED: [YES/NO]
+OUTCOME_CORRECT: [YES/NO/UNKNOWN]
 CONFIDENCE: [0.0-1.0]
-REASONING: [Your reasoning here]
+REASONING: [Your brief reasoning]
 
 Please respond:"""
 
         return prompt
 
-    def _parse_zai_response(self, content: str) -> tuple[float, str]:
+    def _parse_response(self, content: str) -> tuple[float, str]:
         """
-        Parse Z.ai response to extract confidence and reasoning.
+        Parse Groq response to extract confidence and reasoning.
 
         Args:
-            content: Response content from Z.ai
+            content: Response content from Groq
 
         Returns:
             Tuple of (confidence, reasoning)
         """
         try:
-            # Look for CONFIDENCE: line
-            for line in content.split("\n"):
-                if line.startswith("CONFIDENCE:"):
-                    confidence_str = line.split(":")[1].strip()
-                    confidence = float(confidence_str)
-                    break
-            else:
-                # Default confidence if not found
-                confidence = 0.75
+            lines = content.strip().split("\n")
+            confidence = 0.5
+            reasoning = content
+            concluded = False
+            outcome_correct = False
 
-            # Extract reasoning
-            if "REASONING:" in content:
-                reasoning = content.split("REASONING:")[1].strip()
-            else:
-                reasoning = content
+            for line in lines:
+                line = line.strip()
+                if line.startswith("CONCLUDED:"):
+                    concluded = "YES" in line.upper()
+                elif line.startswith("OUTCOME_CORRECT:"):
+                    outcome_correct = "YES" in line.upper()
+                elif line.startswith("CONFIDENCE:"):
+                    try:
+                        conf_str = line.split(":")[1].strip()
+                        # Handle cases like "0.95" or "95%"
+                        conf_str = conf_str.replace("%", "").strip()
+                        confidence = float(conf_str)
+                        if confidence > 1.0:
+                            confidence = confidence / 100.0
+                    except (ValueError, IndexError):
+                        confidence = 0.5
+                elif line.startswith("REASONING:"):
+                    reasoning = line.split(":", 1)[1].strip() if ":" in line else line
+
+            # If event hasn't concluded or outcome is wrong, set low confidence
+            if not concluded:
+                confidence = 0.0
+                reasoning = "Event has not concluded yet. " + reasoning
+            elif not outcome_correct:
+                confidence = min(confidence, 0.3)
+                reasoning = "Predicted outcome may be incorrect. " + reasoning
 
             return confidence, reasoning
 
         except Exception as e:
-            logger.error("zai_response_parse_error", error=str(e))
+            logger.error("response_parse_error", error=str(e))
             return 0.5, content
 
 

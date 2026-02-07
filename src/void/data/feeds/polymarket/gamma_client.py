@@ -70,12 +70,12 @@ class GammaClient:
         session = await self._get_session()
 
         params = {
-            "active": active,
-            "closed": closed,
+            "active": str(active).lower(),
+            "closed": str(closed).lower(),
             "limit": limit,
             "offset": offset,
             "order": order,
-            "ascending": ascending,
+            "ascending": str(ascending).lower(),
             "enableOrderBook": "true",  # Include order book data
         }
 
@@ -93,7 +93,8 @@ class GammaClient:
                 response.raise_for_status()
                 data = await response.json()
 
-                markets = data.get("data", [])
+                # Handle both list response and {"data": [...]} response
+                markets = data if isinstance(data, list) else data.get("data", [])
 
                 logger.debug(
                     "markets_fetched",
@@ -246,8 +247,8 @@ class GammaClient:
             "limit": limit,
             "offset": offset,
             "order": "id",
-            "ascending": False,
-            "closed": False,
+            "ascending": "false",
+            "closed": "false",
         }
 
         try:
@@ -340,6 +341,72 @@ class GammaClient:
                 "yes_price": 0.5,
                 "no_price": 0.5,
             }
+
+    def to_market_model(self, market_data: Dict[str, Any]) -> "Market":
+        """
+        Convert Gamma API market data to Market model.
+
+        Args:
+            market_data: Raw market data from Gamma API
+
+        Returns:
+            Market model instance (not persisted to DB)
+        """
+        from datetime import datetime
+        from decimal import Decimal
+        from void.data.models import Market, MarketStatus
+
+        # Parse token IDs
+        tokens = self.parse_token_ids(market_data)
+
+        # Parse prices
+        prices = self.parse_prices(market_data)
+
+        # Parse end date
+        end_date = None
+        end_date_str = market_data.get("endDate") or market_data.get("end_date_iso")
+        if end_date_str:
+            try:
+                if isinstance(end_date_str, str):
+                    end_date = datetime.fromisoformat(end_date_str.replace("Z", "+00:00"))
+                else:
+                    end_date = end_date_str
+            except Exception:
+                pass
+
+        # Parse status
+        status = MarketStatus.ACTIVE
+        if market_data.get("resolved"):
+            status = MarketStatus.RESOLVED
+        elif market_data.get("closed"):
+            status = MarketStatus.CLOSED
+
+        # Parse tags
+        tags = []
+        if market_data.get("tags"):
+            tags = [t.get("slug", "") for t in market_data.get("tags", []) if isinstance(t, dict)]
+
+        # Create Market model (not saved to DB, just for in-memory use)
+        market = Market(
+            id=market_data.get("id", ""),
+            condition_id=market_data.get("conditionId", ""),
+            question_id=market_data.get("questionID"),
+            question=market_data.get("question", ""),
+            slug=market_data.get("slug", ""),
+            category=market_data.get("groupItemTitle") or market_data.get("category", ""),
+            tags=tags,
+            yes_token_id=tokens.get("yes_token", ""),
+            no_token_id=tokens.get("no_token", ""),
+            yes_price=Decimal(str(prices.get("yes_price", 0.5))),
+            no_price=Decimal(str(prices.get("no_price", 0.5))),
+            spread=Decimal(str(market_data.get("spread", 0))),
+            volume_24h=Decimal(str(market_data.get("volume24hr", 0) or 0)),
+            liquidity=Decimal(str(market_data.get("liquidity", 0) or 0)),
+            status=status,
+            end_date=end_date,
+        )
+
+        return market
 
 
 __all__ = ["GammaClient"]

@@ -59,6 +59,7 @@ celery[redis]==5.3.6
 # ============== UTILITIES ==============
 tenacity==8.2.3
 ratelimit==2.2.1
+qrcode[pil]==7.4.2
 
 # ============== CLI ==============
 click==8.1.7

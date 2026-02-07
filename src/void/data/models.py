@@ -89,7 +89,8 @@ class Account(Base):
     __tablename__ = "accounts"
 
     id: Mapped[UUID] = mapped_column(PG_UUID(as_uuid=True), primary_key=True, default=uuid4)
-    name: Mapped[str] = mapped_column(String(100), unique=True, nullable=False)
+    telegram_user_id: Mapped[int] = mapped_column(BigInteger, nullable=False)  # Owner's Telegram user ID
+    name: Mapped[str] = mapped_column(String(100), nullable=False)
     status: Mapped[AccountStatus] = mapped_column(default=AccountStatus.ACTIVE)
 
     # Wallet info
@@ -117,8 +118,10 @@ class Account(Base):
     positions: Mapped[List["Position"]] = relationship(back_populates="account")
 
     __table_args__ = (
+        Index("ix_accounts_telegram_user_id", "telegram_user_id"),
         Index("ix_accounts_address", "address"),
         Index("ix_accounts_status", "status"),
+        UniqueConstraint("telegram_user_id", "name", name="uq_account_user_name"),
     )
 
 
@@ -128,7 +131,8 @@ class Agent(Base):
     __tablename__ = "agents"
 
     id: Mapped[UUID] = mapped_column(PG_UUID(as_uuid=True), primary_key=True, default=uuid4)
-    name: Mapped[str] = mapped_column(String(100), unique=True, nullable=False)
+    telegram_user_id: Mapped[int] = mapped_column(BigInteger, nullable=False)  # Owner's Telegram user ID
+    name: Mapped[str] = mapped_column(String(100), nullable=False)
     status: Mapped[AgentStatus] = mapped_column(default=AgentStatus.IDLE)
 
     # Account association
@@ -164,8 +168,10 @@ class Agent(Base):
     signals: Mapped[List["Signal"]] = relationship(back_populates="agent")
 
     __table_args__ = (
+        Index("ix_agents_telegram_user_id", "telegram_user_id"),
         Index("ix_agents_status", "status"),
         Index("ix_agents_strategy", "strategy_type"),
+        UniqueConstraint("telegram_user_id", "name", name="uq_agent_user_name"),
     )
 
 

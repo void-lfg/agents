@@ -4,6 +4,7 @@ Wallet operations for Polygon blockchain.
 Handles balance checks, token approvals, and transaction signing.
 """
 
+import asyncio
 from decimal import Decimal
 from typing import Optional
 
@@ -16,7 +17,8 @@ from void.config import config
 logger = structlog.get_logger()
 
 # Contract addresses on Polygon
-USDC_CONTRACT = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"
+USDC_CONTRACT = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"  # USDC.e (bridged)
+USDC_NATIVE_CONTRACT = "0x3c499c542cEF5E3811e1192ce70d8cC03d5c3359"  # Native USDC
 CTF_CONTRACT = "0x4D97DCd97eC945f40cF65F87097ACe5EA0476045"
 CTF_EXCHANGE = "0x4bFb41d5B3570DeFd03C39a9A4D8dE6Bd8B8982E"
 
@@ -105,35 +107,36 @@ class WalletOperations:
         account = Account.from_key(private_key)
         return account.address
 
+    def _get_token_balance(self, contract_addr: str, address: str) -> int:
+        """Sync helper to get token balance (for running in thread)."""
+        contract = self.w3.eth.contract(
+            address=Web3.to_checksum_address(contract_addr),
+            abi=ERC20_ABI,
+        )
+        return contract.functions.balanceOf(Web3.to_checksum_address(address)).call()
+
     async def get_usdc_balance(
         self,
         address: str,
     ) -> Decimal:
         """
-        Get USDC balance for address.
+        Get USDC balance for address (both USDC.e and native USDC).
 
         Args:
             address: Wallet address
 
         Returns:
-            USDC balance (6 decimals)
+            Total USDC balance (6 decimals)
         """
         try:
-            # Initialize contract
-            contract = self.w3.eth.contract(
-                address=Web3.to_checksum_address(USDC_CONTRACT),
-                abi=ERC20_ABI,
+            # Run both RPC calls in parallel
+            bridged, native = await asyncio.gather(
+                asyncio.to_thread(self._get_token_balance, USDC_CONTRACT, address),
+                asyncio.to_thread(self._get_token_balance, USDC_NATIVE_CONTRACT, address),
             )
 
-            # Get balance (returns wei, need to convert to USDC decimals)
-            balance_wei = contract.functions.balanceOf(
-                Web3.to_checksum_address(address)
-            ).call()
-
-            # USDC uses 6 decimals
-            balance = Decimal(balance_wei) / Decimal(10 ** 6)
-
-            return balance
+            total_balance = (Decimal(bridged) + Decimal(native)) / Decimal(10 ** 6)
+            return total_balance
 
         except Exception as e:
             logger.error(

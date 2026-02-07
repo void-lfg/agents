@@ -7,13 +7,14 @@ Provider-agnostic - supports Groq, DeepSeek, OpenAI through factory pattern.
 
 import re
 from datetime import datetime
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, Tuple
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from void.ai.llm_factory import create_llm_client
 from void.ai.conversation_manager import ConversationManager
 from void.ai.context_builder import ContextBuilder
 from void.ai.prompt_templates import PromptTemplates
+from void.ai.web_browser import get_web_browser
 from void.config import config
 
 import structlog
@@ -395,6 +396,235 @@ class ChatService:
         """Clear conversation history for user."""
         await self.conv_manager.clear_history(user_id)
         return "Conversation history cleared."
+
+    async def should_respond_in_group(
+        self,
+        message: str,
+        bot_username: str,
+        is_reply_to_bot: bool = False,
+        chat_context: str = "",
+    ) -> Tuple[bool, str]:
+        """
+        Determine if the bot should respond to a message in a group chat.
+
+        Uses LLM to intelligently decide if a message is relevant to the bot.
+
+        Args:
+            message: The message text
+            bot_username: Bot's username (without @)
+            is_reply_to_bot: Whether this is a reply to bot's message
+            chat_context: Recent chat context for relevance
+
+        Returns:
+            Tuple of (should_respond: bool, reason: str)
+        """
+        # Always respond if directly mentioned
+        if f"@{bot_username}" in message.lower() or bot_username.lower() in message.lower():
+            return True, "direct_mention"
+
+        # Always respond if replying to bot's message
+        if is_reply_to_bot:
+            return True, "reply_to_bot"
+
+        # Use LLM to determine relevance
+        try:
+            relevance_prompt = f"""You are VOID, a trading/crypto AI assistant in a group chat.
+Determine if this message is directed at you or relevant to your expertise.
+
+Your expertise includes:
+- Cryptocurrency, trading, markets, DeFi
+- Polymarket prediction markets
+- Portfolio management, trading strategies
+- Technical analysis, market research
+- Web3, blockchain topics
+
+Message: "{message}"
+
+Recent chat context:
+{chat_context[-500:] if chat_context else "No context"}
+
+Respond with ONLY one of these:
+- "RESPOND" - if the message is asking you something, mentioning trading/crypto topics, or continuing a conversation with you
+- "IGNORE" - if it's just casual chat between other users, off-topic, or not directed at you
+
+Be conservative - only respond when clearly relevant. Don't butt into random conversations.
+"""
+            response = await self.llm.chat_completion(
+                messages=[{"role": "user", "content": relevance_prompt}],
+                temperature=0.1,
+                max_tokens=20,
+            )
+
+            should_respond = "RESPOND" in response.upper()
+            return should_respond, "relevance_check"
+
+        except Exception as e:
+            logger.warning("relevance_check_failed", error=str(e))
+            # Default to not responding if check fails
+            return False, "check_failed"
+
+    async def group_chat(
+        self,
+        user_id: int,
+        username: str,
+        message: str,
+        chat_id: int,
+        chat_context: str = "",
+    ) -> str:
+        """
+        Handle group chat message with a more casual, human-like personality.
+
+        Args:
+            user_id: Telegram user ID
+            username: User's username
+            message: User message
+            chat_id: Group chat ID
+            chat_context: Recent messages for context
+
+        Returns:
+            AI response
+        """
+        if not config.ai.chat_enabled:
+            return "AI chat is currently disabled."
+
+        try:
+            # Check if message needs web search
+            web_context = ""
+            if self._needs_web_search(message):
+                web_context = await self._perform_web_search(message)
+
+            # Build group chat prompt
+            group_system_prompt = """You're VOID - a chill trading/crypto AI hanging out in this group chat.
+
+PERSONALITY:
+- You're like a knowledgeable friend, not a formal assistant
+- Keep responses SHORT and conversational (1-3 sentences usually)
+- Use casual language: "yo", "ngl", "lmao", "tbh", "fr", "lowkey", "bet"
+- Crypto slang is your second language: gm, gn, wagmi, ngmi, ser, anon, ape, degen, based, rekt
+- Match the vibe of the conversation
+- Don't be cringe or try too hard
+- Be witty and slightly sarcastic when appropriate
+- If you don't know something, just say so casually
+
+DON'Ts:
+- Don't be overly helpful or assistant-like
+- Don't use bullet points or formal formatting
+- Don't repeat the question back
+- Don't give unsolicited advice
+- Don't be preachy about risks (unless asked)
+- Keep it brief - you're chatting, not writing an essay
+
+Remember: You're part of the group, not serving the group. Be real."""
+
+            # Include web context if available
+            context_addition = ""
+            if web_context:
+                context_addition = f"\n\nWeb search results for context:\n{web_context}\n\n(Use this info naturally, don't announce you searched)"
+
+            # Get conversation history for this group
+            history = await self.conv_manager.get_conversation(chat_id)
+
+            response = await self.llm.chat_completion(
+                messages=[
+                    {"role": "system", "content": group_system_prompt + context_addition},
+                    *[{"role": h.get("role", "user"), "content": h.get("content", "")} for h in history[-5:]],
+                    {"role": "user", "content": f"@{username}: {message}"}
+                ],
+                temperature=0.9,  # More creative for casual chat
+                max_tokens=300,   # Keep responses short
+            )
+
+            # Clean up response
+            response = strip_markdown(response)
+
+            # Save to conversation history (use chat_id for group context)
+            await self.conv_manager.add_message(chat_id, "user", f"@{username}: {message}")
+            await self.conv_manager.add_message(chat_id, "assistant", response)
+
+            return response
+
+        except Exception as e:
+            logger.error("group_chat_error", error=str(e), exc_info=True)
+            return self._get_casual_error_response()
+
+    def _needs_web_search(self, message: str) -> bool:
+        """Check if message might benefit from web search."""
+        search_indicators = [
+            "what is", "who is", "when did", "how does",
+            "latest", "news", "price of", "happened",
+            "search", "look up", "find", "google",
+            "today", "yesterday", "recent", "current",
+            "http://", "https://", ".com", ".io", ".org"
+        ]
+        message_lower = message.lower()
+        return any(indicator in message_lower for indicator in search_indicators)
+
+    async def _perform_web_search(self, message: str) -> str:
+        """Perform web search and return summary."""
+        try:
+            browser = get_web_browser()
+
+            # Extract search query from message
+            # Remove common prefixes
+            query = message.lower()
+            for prefix in ["what is", "who is", "search for", "look up", "google"]:
+                query = query.replace(prefix, "")
+            query = query.strip()
+
+            if len(query) < 3:
+                return ""
+
+            results = await browser.search_duckduckgo(query, max_results=3)
+
+            if not results:
+                return ""
+
+            summary = "Recent web info:\n"
+            for r in results:
+                summary += f"- {r['title']}: {r['snippet'][:150]}\n"
+
+            return summary
+
+        except Exception as e:
+            logger.warning("web_search_failed", error=str(e))
+            return ""
+
+    async def fetch_url_content(self, url: str) -> str:
+        """Fetch and summarize content from a URL."""
+        try:
+            browser = get_web_browser()
+            content = await browser.fetch_url(url, max_chars=3000)
+
+            if not content:
+                return "Couldn't fetch that URL"
+
+            # Summarize if too long
+            if len(content) > 1000:
+                summary_prompt = f"Summarize this in 2-3 sentences:\n\n{content[:2000]}"
+                summary = await self.llm.chat_completion(
+                    messages=[{"role": "user", "content": summary_prompt}],
+                    temperature=0.3,
+                    max_tokens=200,
+                )
+                return strip_markdown(summary)
+
+            return content
+
+        except Exception as e:
+            logger.error("url_fetch_error", error=str(e))
+            return "couldn't load that link rn"
+
+    def _get_casual_error_response(self) -> str:
+        """Get a casual error response."""
+        import random
+        responses = [
+            "brain lagged for a sec, try again",
+            "something broke lol, one sec",
+            "my bad, didn't catch that",
+            "glitched out, say again?",
+            "rip, error. try again",
+        ]
+        return random.choice(responses)
 
 
 __all__ = ["ChatService"]

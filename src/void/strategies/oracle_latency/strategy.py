@@ -12,7 +12,7 @@ Risk: Very low (outcome is already known)
 from dataclasses import dataclass, field
 from datetime import datetime, timezone, timedelta
 from decimal import Decimal
-from typing import List, AsyncIterator, Optional, Any
+from typing import List, AsyncIterator, Optional, Any, Dict
 import asyncio
 
 from void.strategies.base import (
@@ -21,6 +21,7 @@ from void.strategies.base import (
     StrategyContext,
 )
 from void.data.models import Market, Signal, SignalStatus, StrategyType, MarketStatus
+from void.strategies.oracle_latency.verifier import OutcomeVerifier, VerificationResult
 import structlog
 
 logger = structlog.get_logger()
@@ -39,13 +40,16 @@ class OracleLatencyConfig(StrategyConfig):
     min_hours_since_end: int = 0  # Min hours (immediate trading ok)
 
     # AI verification
-    ai_confidence_threshold: Decimal = Decimal("0.95")
+    ai_confidence_threshold: Decimal = Decimal("0.85")
     use_ai_verification: bool = True
     verification_timeout_seconds: int = 30
 
     # Categories to focus on
     focus_categories: List[str] = field(default_factory=list)
     ignore_categories: List[str] = field(default_factory=list)
+
+    # Execution mode
+    dry_run: bool = True  # Default to dry-run for safety
 
 
 class OracleLatencyStrategy(BaseStrategy):
@@ -70,6 +74,7 @@ class OracleLatencyStrategy(BaseStrategy):
         super().__init__(config)
         self.config: OracleLatencyConfig = config
         self._processed_markets: set = set()
+        self._verifier = OutcomeVerifier() if config.use_ai_verification else None
 
     async def scan_markets(
         self,
@@ -284,21 +289,77 @@ class OracleLatencyStrategy(BaseStrategy):
         signal.profit_margin = current_margin
 
         # AI verification (if enabled)
-        if self.config.use_ai_verification:
-            # TODO: Implement AI verifier
-            # For now, set high confidence based on math
-            signal.confidence = Decimal("0.90")
-        else:
-            signal.confidence = Decimal("0.90")
+        if self.config.use_ai_verification and self._verifier:
+            try:
+                verification = await asyncio.wait_for(
+                    self._verifier.verify_outcome(
+                        question=market.question,
+                        predicted_outcome=signal.predicted_outcome,
+                        market_category=getattr(market, 'category', None),
+                    ),
+                    timeout=self.config.verification_timeout_seconds,
+                )
 
-        signal.verification_source = "price_check"
-        signal.status = SignalStatus.VERIFIED
+                signal.confidence = Decimal(str(verification.confidence))
+                signal.verification_source = verification.source.value
+                signal.verification_data = {
+                    "reasoning": verification.reasoning,
+                    "raw_data": verification.raw_data,
+                }
+
+                # Check if AI confirms our prediction
+                if verification.confidence >= float(self.config.ai_confidence_threshold):
+                    signal.status = SignalStatus.VERIFIED
+                    self.logger.info(
+                        "signal_verified_by_ai",
+                        signal_id=str(signal.id),
+                        confidence=verification.confidence,
+                        source=verification.source.value,
+                        reasoning=verification.reasoning[:100],
+                    )
+                else:
+                    # AI not confident enough
+                    signal.status = SignalStatus.REJECTED
+                    self.logger.info(
+                        "signal_rejected_low_confidence",
+                        signal_id=str(signal.id),
+                        confidence=verification.confidence,
+                        threshold=float(self.config.ai_confidence_threshold),
+                    )
+
+            except asyncio.TimeoutError:
+                self.logger.warning(
+                    "ai_verification_timeout",
+                    signal_id=str(signal.id),
+                    timeout=self.config.verification_timeout_seconds,
+                )
+                # Fallback to price-only verification with lower confidence
+                signal.confidence = Decimal("0.75")
+                signal.verification_source = "price_check_timeout"
+                signal.status = SignalStatus.VERIFIED
+
+            except Exception as e:
+                self.logger.error(
+                    "ai_verification_error",
+                    signal_id=str(signal.id),
+                    error=str(e),
+                )
+                # Fallback to price-only verification
+                signal.confidence = Decimal("0.70")
+                signal.verification_source = "price_check_fallback"
+                signal.status = SignalStatus.VERIFIED
+        else:
+            # No AI verification, use price-only
+            signal.confidence = Decimal("0.85")
+            signal.verification_source = "price_check"
+            signal.status = SignalStatus.VERIFIED
 
         self.logger.info(
             "signal_verified",
             signal_id=str(signal.id),
             confidence=float(signal.confidence),
             price=float(current_price),
+            source=signal.verification_source,
         )
 
         return signal

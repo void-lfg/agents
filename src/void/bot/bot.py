@@ -4,11 +4,16 @@ VOID Telegram Bot - Main bot implementation.
 Provides Telegram interface for controlling and monitoring VOID trading agent.
 """
 
+import asyncio
+import io
 import logging
 from datetime import datetime, timezone
 from typing import Optional
 
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+import qrcode
+from PIL import Image
+
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, InputFile
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -52,6 +57,9 @@ class VoidBot:
         self.event_bus: Optional[EventBus] = None
         self.scheduler = get_scheduler()
 
+        # Persistent agent management - keeps orchestrators alive
+        self._running_agents: dict = {}  # agent_id -> {"orchestrator": ..., "task": ...}
+
     async def is_authorized(self, user_id: int) -> bool:
         """Check if user is authorized."""
         if not self.config.allowed_user_ids:
@@ -63,6 +71,55 @@ class VoidBot:
         if not self.config.admin_user_ids:
             return True  # Allow all if list is empty
         return user_id in self.config.admin_user_ids
+
+    def is_private_chat(self, update: Update) -> bool:
+        """Check if the message is from a private chat (not group)."""
+        if update.effective_chat:
+            return update.effective_chat.type == "private"
+        return False
+
+    async def require_private_chat(self, update: Update) -> bool:
+        """
+        Check if command is in private chat. If not, send warning and return False.
+        Use this for commands that access personal/sensitive data.
+        """
+        if not self.is_private_chat(update):
+            await update.message.reply_text(
+                "🔒 This command contains personal data and only works in private chat.\n\n"
+                "Please message me directly to use this feature."
+            )
+            return False
+        return True
+
+    def generate_deposit_qr(self, address: str) -> io.BytesIO:
+        """
+        Generate a QR code image for deposit address.
+
+        Args:
+            address: Wallet address to encode
+
+        Returns:
+            BytesIO buffer containing PNG image
+        """
+        # Create QR code with high error correction
+        qr = qrcode.QRCode(
+            version=1,
+            error_correction=qrcode.constants.ERROR_CORRECT_H,
+            box_size=10,
+            border=4,
+        )
+        qr.add_data(address)
+        qr.make(fit=True)
+
+        # Create image with dark purple color scheme
+        img = qr.make_image(fill_color="#1a1a2e", back_color="white")
+
+        # Save to bytes buffer
+        buffer = io.BytesIO()
+        img.save(buffer, format="PNG")
+        buffer.seek(0)
+
+        return buffer
 
     # ============== Command Handlers ==============
 
@@ -133,6 +190,9 @@ class VoidBot:
 *🤖 Agent Control:*
 /start_agent - Start trading agent
 /stop_agent - Stop trading agent
+/go_live - Enable live trading
+/go_dry - Switch to dry-run mode
+/agent_config - View agent settings
 /agent - Quick agent control
 
 *⚙️ Settings:*
@@ -218,12 +278,22 @@ class VoidBot:
             await update.message.reply_text("⛔ Not authorized")
             return
 
+        # Require private chat for sensitive financial data
+        if not await self.require_private_chat(update):
+            return
+
         async with async_session_maker() as db:
-            result = await db.execute(select(Account))
+            # Filter by user's telegram_user_id
+            result = await db.execute(
+                select(Account).where(Account.telegram_user_id == user_id)
+            )
             accounts = result.scalars().all()
 
         if not accounts:
-            await update.message.reply_text("📊 No accounts found")
+            await update.message.reply_text(
+                "📊 No accounts found.\n\n"
+                "Use /create_account to create your first trading account."
+            )
             return
 
         portfolio_text = "💼 *Portfolio Overview*\n\n"
@@ -246,11 +316,29 @@ class VoidBot:
             await update.message.reply_text("⛔ Not authorized")
             return
 
+        # Require private chat for sensitive financial data
+        if not await self.require_private_chat(update):
+            return
+
         try:
             async with async_session_maker() as db:
+                # Get user's accounts first
+                accounts_result = await db.execute(
+                    select(Account.id).where(Account.telegram_user_id == user_id)
+                )
+                user_account_ids = [row[0] for row in accounts_result.fetchall()]
+
+                if not user_account_ids:
+                    await update.message.reply_text("📊 No accounts found. Create one with /create_account")
+                    return
+
+                # Get positions only for user's accounts
                 result = await db.execute(
                     select(Position)
-                    .where(Position.is_closed == False)
+                    .where(
+                        Position.is_closed == False,
+                        Position.account_id.in_(user_account_ids)
+                    )
                     .order_by(Position.opened_at.desc())
                     .limit(10)
                 )
@@ -329,14 +417,24 @@ class VoidBot:
             await update.message.reply_text("⛔ Not authorized")
             return
 
+        # Require private chat for sensitive data
+        if not await self.require_private_chat(update):
+            return
+
         async with async_session_maker() as db:
+            # Filter by user's telegram_user_id
             result = await db.execute(
-                select(Agent).order_by(Agent.created_at.desc())
+                select(Agent)
+                .where(Agent.telegram_user_id == user_id)
+                .order_by(Agent.created_at.desc())
             )
             agents = result.scalars().all()
 
         if not agents:
-            await update.message.reply_text("🤖 No agents found")
+            await update.message.reply_text(
+                "🤖 No agents found.\n\n"
+                "Use /create_agent to create your first trading agent."
+            )
             return
 
         agents_text = f"🤖 *Trading Agents* ({len(agents)})\n\n"
@@ -435,13 +533,17 @@ class VoidBot:
         """Handle /create_account command - Create a new trading account."""
         user_id = update.effective_user.id
 
-        if not await self.is_admin(user_id):
-            await update.message.reply_text("⛔ Admin privileges required")
+        if not await self.is_authorized(user_id):
+            await update.message.reply_text("⛔ Not authorized")
+            return
+
+        # Require private chat for sensitive key display
+        if not await self.require_private_chat(update):
             return
 
         try:
             from void.accounts.service import AccountService
-            from eth_account import Account
+            from eth_account import Account as EthAccount
             from datetime import datetime
 
             async with async_session_maker() as db:
@@ -449,11 +551,13 @@ class VoidBot:
 
                 # Generate new wallet
                 account_name = f"account-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
-                acct = Account.create()
+                acct = EthAccount.create()
                 private_key = acct.key.hex()
 
+                # Create account with user's telegram_user_id
                 account = await service.create_account(
                     name=account_name,
+                    telegram_user_id=user_id,
                     private_key=private_key,
                 )
 
@@ -475,7 +579,7 @@ class VoidBot:
   • Save this private key securely NOW
   • This is the ONLY time you'll see it
   • System will encrypt and store it, but you need the backup
-  • Use this key to import wallet into MetaMask或其他钱包
+  • Use this key to import wallet into MetaMask
 
 📝 *Next Steps:*
   1. Save your private key above
@@ -494,15 +598,22 @@ class VoidBot:
         """Handle /remove_account command - Remove an account with confirmation."""
         user_id = update.effective_user.id
 
-        if not await self.is_admin(user_id):
-            await update.message.reply_text("⛔ Admin privileges required")
+        if not await self.is_authorized(user_id):
+            await update.message.reply_text("⛔ Not authorized")
+            return
+
+        # Require private chat for sensitive operations
+        if not await self.require_private_chat(update):
             return
 
         try:
             async with async_session_maker() as db:
                 from sqlalchemy import select
 
-                result = await db.execute(select(Account))
+                # Only get user's own accounts
+                result = await db.execute(
+                    select(Account).where(Account.telegram_user_id == user_id)
+                )
                 accounts = result.scalars().all()
 
                 if not accounts:
@@ -547,8 +658,12 @@ Select an account to remove:
         """Handle /create_agent command - Create a new trading agent."""
         user_id = update.effective_user.id
 
-        if not await self.is_admin(user_id):
-            await update.message.reply_text("⛔ Admin privileges required")
+        if not await self.is_authorized(user_id):
+            await update.message.reply_text("⛔ Not authorized")
+            return
+
+        # Require private chat
+        if not await self.require_private_chat(update):
             return
 
         try:
@@ -556,9 +671,13 @@ Select an account to remove:
             from datetime import datetime, timezone
 
             async with async_session_maker() as db:
-                # Get first account
+                # Get user's first account
                 from sqlalchemy import select
-                result = await db.execute(select(Account).limit(1))
+                result = await db.execute(
+                    select(Account)
+                    .where(Account.telegram_user_id == user_id)
+                    .limit(1)
+                )
                 account = result.scalar_one_or_none()
 
                 if not account:
@@ -567,19 +686,36 @@ Select an account to remove:
                     )
                     return
 
-                # Create agent
+                # Create agent with user's telegram_user_id
                 agent = Agent(
-                    name=f"oracle-agent-{datetime.now().strftime('%Y%m%d-%H%M%S')}",
+                    telegram_user_id=user_id,
+                    name=f"agent-{datetime.now().strftime('%Y%m%d-%H%M%S')}",
                     status=AgentStatus.IDLE,
                     account_id=account.id,
                     strategy_type=StrategyType.ORACLE_LATENCY,
                     strategy_config={
+                        # Capital allocation
                         "max_position_size_usd": "500",
                         "max_positions": 3,
+                        # Risk parameters
                         "min_profit_margin": "0.01",
+                        "max_slippage": "0.02",
+                        # Oracle latency specific
                         "min_discount": "0.01",
+                        "max_price": "0.99",
                         "max_hours_since_end": 24,
+                        "min_hours_since_end": 0,
+                        # AI verification
                         "use_ai_verification": True,
+                        "ai_confidence_threshold": "0.85",
+                        "verification_timeout_seconds": 30,
+                        # Filters
+                        "min_liquidity_usd": "1000",
+                        "min_volume_24h_usd": "5000",
+                        # Timing
+                        "scan_interval_seconds": 30,
+                        # Safety - dry run by default
+                        "dry_run": True,
                     },
                     max_position_size=500,
                     max_daily_loss=100,
@@ -593,13 +729,15 @@ Select an account to remove:
                 message = (
                     f"✅ *Agent Created Successfully!*\n\n"
                     f"🤖 *Agent Details:*\n"
-                    f"  • Name: {agent.name}\n"
-                    f"  • Strategy: {agent.strategy_type.value}\n"
+                    f"  • Name: `{agent.name}`\n"
+                    f"  • Strategy: Oracle Latency\n"
                     f"  • Account: {account.name}\n"
                     f"  • Max Position: ${agent.max_position_size}\n"
-                    f"  • Max Positions: {agent.max_concurrent_positions}\n\n"
-                    f"🚀 Start the agent with:\n"
-                    f"  /agent"
+                    f"  • AI Verification: ✅ Enabled\n"
+                    f"  • Mode: 🧪 DRY-RUN (no real trades)\n\n"
+                    f"🚀 *Start the agent:*\n"
+                    f"  `/start_agent {agent.name}`\n\n"
+                    f"⚙️ To enable live trading, update config."
                 )
 
                 await update.message.reply_text(message, parse_mode="Markdown")
@@ -612,8 +750,12 @@ Select an account to remove:
         """Handle /sync command - Sync wallet balances from blockchain."""
         user_id = update.effective_user.id
 
-        if not await self.is_admin(user_id):
-            await update.message.reply_text("⛔ Admin privileges required")
+        if not await self.is_authorized(user_id):
+            await update.message.reply_text("⛔ Not authorized")
+            return
+
+        # Require private chat
+        if not await self.require_private_chat(update):
             return
 
         try:
@@ -622,9 +764,11 @@ Select an account to remove:
             async with async_session_maker() as db:
                 service = AccountService(db)
 
-                # Get all accounts
+                # Get only user's accounts
                 from sqlalchemy import select
-                result = await db.execute(select(Account))
+                result = await db.execute(
+                    select(Account).where(Account.telegram_user_id == user_id)
+                )
                 accounts = result.scalars().all()
 
                 if not accounts:
@@ -820,7 +964,10 @@ Select an account to remove:
             async with async_session_maker() as db:
                 from sqlalchemy import select
 
-                result = await db.execute(select(Account))
+                # Get only user's accounts
+                result = await db.execute(
+                    select(Account).where(Account.telegram_user_id == user_id)
+                )
                 accounts = result.scalars().all()
 
                 if not accounts:
@@ -859,7 +1006,10 @@ Select an account to remove:
             async with async_session_maker() as db:
                 from sqlalchemy import select
 
-                result = await db.execute(select(Agent))
+                # Get only user's agents
+                result = await db.execute(
+                    select(Agent).where(Agent.telegram_user_id == user_id)
+                )
                 agents = result.scalars().all()
 
                 if not agents:
@@ -897,9 +1047,23 @@ Select an account to remove:
             async with async_session_maker() as db:
                 from sqlalchemy import select
 
+                # Get user's accounts first
+                accounts_result = await db.execute(
+                    select(Account.id).where(Account.telegram_user_id == user_id)
+                )
+                user_account_ids = [row[0] for row in accounts_result.fetchall()]
+
+                if not user_account_ids:
+                    await query.message.reply_text("📭 No accounts found")
+                    return
+
+                # Get positions only for user's accounts
                 result = await db.execute(
                     select(Position)
-                    .where(Position.is_closed == False)
+                    .where(
+                        Position.is_closed == False,
+                        Position.account_id.in_(user_account_ids)
+                    )
                     .order_by(Position.opened_at.desc())
                     .limit(10)
                 )
@@ -1060,24 +1224,26 @@ Select an account to remove:
 
     async def _cb_create_account(self, query, user_id):
         """Callback for create account."""
-        if not await self.is_admin(user_id):
-            await query.message.reply_text("⛔ Admin privileges required")
+        if not await self.is_authorized(user_id):
+            await query.message.reply_text("⛔ Not authorized")
             return
 
         try:
             from void.accounts.service import AccountService
-            from eth_account import Account
+            from eth_account import Account as EthAccount
             from datetime import datetime
 
             async with async_session_maker() as db:
                 service = AccountService(db)
 
                 account_name = f"account-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
-                acct = Account.create()
+                acct = EthAccount.create()
                 private_key = acct.key.hex()
 
+                # Create account with user's telegram_user_id
                 account = await service.create_account(
                     name=account_name,
+                    telegram_user_id=user_id,
                     private_key=private_key,
                 )
 
@@ -1103,8 +1269,8 @@ Select an account to remove:
 
     async def _cb_create_agent(self, query, user_id):
         """Callback for create agent."""
-        if not await self.is_admin(user_id):
-            await query.message.reply_text("⛔ Admin privileges required")
+        if not await self.is_authorized(user_id):
+            await query.message.reply_text("⛔ Not authorized")
             return
 
         try:
@@ -1113,14 +1279,21 @@ Select an account to remove:
 
             async with async_session_maker() as db:
                 from sqlalchemy import select
-                result = await db.execute(select(Account).limit(1))
+                # Get user's first account
+                result = await db.execute(
+                    select(Account)
+                    .where(Account.telegram_user_id == user_id)
+                    .limit(1)
+                )
                 account = result.scalar_one_or_none()
 
                 if not account:
                     await query.message.reply_text("❌ No account found. Create one first.")
                     return
 
+                # Create agent with user's telegram_user_id
                 agent = Agent(
+                    telegram_user_id=user_id,
                     name=f"agent-{datetime.now().strftime('%Y%m%d-%H%M%S')}",
                     status=AgentStatus.IDLE,
                     account_id=account.id,
@@ -1150,15 +1323,18 @@ Select an account to remove:
 
     async def _cb_remove_account(self, query, user_id):
         """Callback for remove account - shows account selection."""
-        if not await self.is_admin(user_id):
-            await query.message.reply_text("⛔ Admin privileges required")
+        if not await self.is_authorized(user_id):
+            await query.message.reply_text("⛔ Not authorized")
             return
 
         try:
             async with async_session_maker() as db:
                 from sqlalchemy import select
 
-                result = await db.execute(select(Account))
+                # Only get user's own accounts
+                result = await db.execute(
+                    select(Account).where(Account.telegram_user_id == user_id)
+                )
                 accounts = result.scalars().all()
 
                 if not accounts:
@@ -1199,8 +1375,8 @@ Select an account to remove:
 
     async def _handle_remove_account(self, query, user_id, action):
         """Handle actual account removal with confirmation."""
-        if not await self.is_admin(user_id):
-            await query.message.reply_text("⛔ Admin privileges required")
+        if not await self.is_authorized(user_id):
+            await query.message.reply_text("⛔ Not authorized")
             return
 
         try:
@@ -1213,11 +1389,17 @@ Select an account to remove:
                 from sqlalchemy import select
                 from uuid import UUID
 
-                result = await db.execute(select(Account).where(Account.id == UUID(account_id)))
+                # CRITICAL: Verify user owns this account
+                result = await db.execute(
+                    select(Account).where(
+                        Account.id == UUID(account_id),
+                        Account.telegram_user_id == user_id
+                    )
+                )
                 account = result.scalar_one_or_none()
 
                 if not account:
-                    await query.message.reply_text("❌ Account not found")
+                    await query.message.reply_text("❌ Account not found or you don't have permission")
                     return
 
                 # Check if account has balance
@@ -1289,8 +1471,8 @@ Make sure you have saved your private key before deleting.
 
     async def _confirm_remove_account(self, query, user_id, action):
         """Execute account removal after confirmation."""
-        if not await self.is_admin(user_id):
-            await query.message.reply_text("⛔ Admin privileges required")
+        if not await self.is_authorized(user_id):
+            await query.message.reply_text("⛔ Not authorized")
             return
 
         try:
@@ -1303,11 +1485,17 @@ Make sure you have saved your private key before deleting.
                 from sqlalchemy import select
                 from uuid import UUID
 
-                result = await db.execute(select(Account).where(Account.id == UUID(account_id)))
+                # CRITICAL: Verify user owns this account
+                result = await db.execute(
+                    select(Account).where(
+                        Account.id == UUID(account_id),
+                        Account.telegram_user_id == user_id
+                    )
+                )
                 account = result.scalar_one_or_none()
 
                 if not account:
-                    await query.message.reply_text("❌ Account not found")
+                    await query.message.reply_text("❌ Account not found or you don't have permission")
                     return
 
                 account_name = account.name
@@ -1347,20 +1535,33 @@ We hope you saved your private key!
             async with async_session_maker() as db:
                 from sqlalchemy import select
 
-                result = await db.execute(select(Account).limit(1))
+                # Get user's first account
+                result = await db.execute(
+                    select(Account)
+                    .where(Account.telegram_user_id == user_id)
+                    .limit(1)
+                )
                 account = result.scalar_one_or_none()
 
                 if not account:
                     await query.message.reply_text("❌ No account found")
                     return
 
-                message = (
+                # Generate QR code for address
+                qr_buffer = self.generate_deposit_qr(account.address)
+
+                caption = (
                     f"💰 *Deposit*\n\n"
-                    f"Address: `{account.address}`\n\n"
-                    f"Send USDC (Polygon) to fund your account."
+                    f"🏦 *Address:*\n`{account.address}`\n\n"
+                    f"📝 Send USDC (Polygon) to fund your account.\n\n"
+                    f"🔄 Use /sync after sending"
                 )
 
-                await query.message.reply_text(message, parse_mode="Markdown")
+                await query.message.reply_photo(
+                    photo=InputFile(qr_buffer, filename="deposit_qr.png"),
+                    caption=caption,
+                    parse_mode="Markdown"
+                )
         except Exception as e:
             await query.message.reply_text(f"❌ Error: {str(e)[:100]}")
 
@@ -1382,8 +1583,8 @@ We hope you saved your private key!
 
     async def _cb_sync(self, query, user_id):
         """Callback for sync balances."""
-        if not await self.is_admin(user_id):
-            await query.message.reply_text("⛔ Admin privileges required")
+        if not await self.is_authorized(user_id):
+            await query.message.reply_text("⛔ Not authorized")
             return
 
         try:
@@ -1392,7 +1593,10 @@ We hope you saved your private key!
             async with async_session_maker() as db:
                 from sqlalchemy import select
 
-                result = await db.execute(select(Account))
+                # Get only user's accounts
+                result = await db.execute(
+                    select(Account).where(Account.telegram_user_id == user_id)
+                )
                 accounts = result.scalars().all()
 
                 if not accounts:
@@ -1448,8 +1652,12 @@ We hope you saved your private key!
         """Handle /start_agent command - Start a trading agent."""
         user_id = update.effective_user.id
 
-        if not await self.is_admin(user_id):
-            await update.message.reply_text("⛔ Admin privileges required")
+        if not await self.is_authorized(user_id):
+            await update.message.reply_text("⛔ Not authorized")
+            return
+
+        # Require private chat
+        if not await self.require_private_chat(update):
             return
 
         try:
@@ -1466,9 +1674,12 @@ We hope you saved your private key!
             async with async_session_maker() as db:
                 from sqlalchemy import select, or_
 
-                # Try to find agent - first try by name (easiest)
+                # Try to find agent by name - filter by user's agents only
                 result = await db.execute(
-                    select(Agent).where(Agent.name == agent_identifier)
+                    select(Agent).where(
+                        Agent.name == agent_identifier,
+                        Agent.telegram_user_id == user_id
+                    )
                 )
                 agent = result.scalar_one_or_none()
 
@@ -1478,7 +1689,10 @@ We hope you saved your private key!
                         from uuid import UUID
                         agent_uuid = UUID(agent_identifier)
                         result = await db.execute(
-                            select(Agent).where(Agent.id == agent_uuid)
+                            select(Agent).where(
+                                Agent.id == agent_uuid,
+                                Agent.telegram_user_id == user_id
+                            )
                         )
                         agent = result.scalar_one_or_none()
                     except ValueError:
@@ -1489,19 +1703,49 @@ We hope you saved your private key!
                     await update.message.reply_text(f"❌ Agent '{agent_identifier}' not found")
                     return
 
-                # Update agent status
-                agent.status = AgentStatus.RUNNING
-                agent.last_heartbeat = datetime.now(timezone.utc)
-                await db.commit()
+                # Check if agent is already running in our manager
+                agent_id_str = str(agent.id)
+                if agent_id_str in self._running_agents:
+                    await update.message.reply_text(
+                        f"⚠️ Agent {agent.name} is already running!\n\n"
+                        f"Use /stop_agent {agent.name} first to restart it."
+                    )
+                    return
 
-                message = (
-                    f"✅ Agent Started!\n\n"
-                    f"🤖 Agent: {agent.name}\n"
-                    f"  • Strategy: {agent.strategy_type.value}\n"
-                    f"  • Status: {agent.status.value}\n\n"
-                    f"🚀 Agent is now scanning for opportunities..."
+                # Update status in database first
+                agent.status = AgentStatus.RUNNING
+                agent.last_heartbeat = datetime.utcnow()
+                await db.commit()
+                await db.refresh(agent)
+
+                # Send initial confirmation
+                await update.message.reply_text(
+                    f"🚀 Starting agent {agent.name}...\n"
+                    f"Initializing market scanner..."
                 )
-                await update.message.reply_text(message)
+
+            # Create and store the background task using shared scan loop method
+            task = asyncio.create_task(
+                self._create_agent_scan_loop(agent.id, agent.name, user_id)
+            )
+            self._running_agents[agent_id_str] = {
+                "task": task,
+                "name": agent.name,
+                "started_at": datetime.utcnow()
+            }
+
+            await update.message.reply_text(
+                f"✅ Agent Started!\n\n"
+                f"🤖 Agent: {agent.name}\n"
+                f"  • Strategy: {agent.strategy_type.value}\n"
+                f"  • Status: RUNNING\n\n"
+                f"🚀 Agent is now actively scanning markets!\n\n"
+                f"The agent will:\n"
+                f"  • Scan Polymarket every 30 seconds\n"
+                f"  • Look for resolved events with price discrepancies\n"
+                f"  • Log opportunities found\n\n"
+                f"Use /agents to monitor status."
+            )
 
         except Exception as e:
             logger.error(f"Start agent error: {e}", exc_info=True)
@@ -1551,15 +1795,28 @@ We hope you saved your private key!
                     await update.message.reply_text(f"❌ Agent '{agent_identifier}' not found")
                     return
 
+                # Cancel the background task if running
+                agent_id_str = str(agent.id)
+                task_cancelled = False
+                if agent_id_str in self._running_agents:
+                    try:
+                        self._running_agents[agent_id_str]["task"].cancel()
+                        del self._running_agents[agent_id_str]
+                        task_cancelled = True
+                    except Exception as e:
+                        logger.error(f"Error cancelling agent task: {e}")
+
                 # Update agent status
                 agent.status = AgentStatus.STOPPED
                 await db.commit()
 
+                status_note = "Scan loop cancelled." if task_cancelled else "Was not actively scanning."
                 message = (
                     f"⏹️ Agent Stopped\n\n"
                     f"🤖 Agent: {agent.name}\n"
-                    f"  • Status: {agent.status.value}\n\n"
-                    f"Agent will complete existing trades and stop scanning."
+                    f"  • Status: {agent.status.value}\n"
+                    f"  • {status_note}\n\n"
+                    f"Agent will complete existing trades."
                 )
                 await update.message.reply_text(message)
 
@@ -1627,6 +1884,206 @@ We hope you saved your private key!
         except Exception as e:
             logger.error(f"Delete agent error: {e}", exc_info=True)
             await update.message.reply_text(f"❌ Error deleting agent: {str(e)[:100]}")
+
+    async def go_live(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle /go_live command - Enable live trading for an agent."""
+        user_id = update.effective_user.id
+
+        if not await self.is_admin(user_id):
+            await update.message.reply_text("⛔ Admin privileges required")
+            return
+
+        try:
+            if not context.args or len(context.args) < 1:
+                await update.message.reply_text(
+                    "❌ Usage: `/go_live <agent_name>`\n\n"
+                    "⚠️ This enables REAL trading with real funds!\n\n"
+                    "Use /agents to see available agents.",
+                    parse_mode="Markdown"
+                )
+                return
+
+            agent_identifier = context.args[0]
+
+            async with async_session_maker() as db:
+                # Try to find by name first, then by UUID if it looks like one
+                from uuid import UUID as PyUUID
+                try:
+                    agent_uuid = PyUUID(agent_identifier)
+                    result = await db.execute(
+                        select(Agent).where(
+                            (Agent.name == agent_identifier) |
+                            (Agent.id == agent_uuid)
+                        )
+                    )
+                except ValueError:
+                    # Not a valid UUID, search by name only
+                    result = await db.execute(
+                        select(Agent).where(Agent.name == agent_identifier)
+                    )
+                agent = result.scalar_one_or_none()
+
+                if not agent:
+                    await update.message.reply_text(f"❌ Agent '{agent_identifier}' not found")
+                    return
+
+                # Update strategy config to disable dry_run
+                # Create a new dict to ensure SQLAlchemy detects the change
+                config = dict(agent.strategy_config or {})
+                config["dry_run"] = False
+                agent.strategy_config = config
+                from sqlalchemy.orm.attributes import flag_modified
+                flag_modified(agent, "strategy_config")
+                await db.commit()
+
+                message = (
+                    f"🔴 *LIVE TRADING ENABLED*\n\n"
+                    f"🤖 Agent: {agent.name}\n"
+                    f"💰 Mode: *LIVE* (real trades)\n\n"
+                    f"⚠️ *Warning:* Agent will now execute real trades!\n\n"
+                    f"💡 Use `/go_dry {agent.name}` to switch back to dry-run mode.\n"
+                    f"🔄 Restart agent with `/stop_agent` then `/start_agent` to apply."
+                )
+                await update.message.reply_text(message, parse_mode="Markdown")
+
+        except Exception as e:
+            logger.error(f"Go live error: {e}", exc_info=True)
+            await update.message.reply_text(f"❌ Error: {str(e)[:100]}")
+
+    async def go_dry(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle /go_dry command - Enable dry-run mode for an agent."""
+        user_id = update.effective_user.id
+
+        if not await self.is_admin(user_id):
+            await update.message.reply_text("⛔ Admin privileges required")
+            return
+
+        try:
+            if not context.args or len(context.args) < 1:
+                await update.message.reply_text(
+                    "❌ Usage: `/go_dry <agent_name>`\n\n"
+                    "Use /agents to see available agents.",
+                    parse_mode="Markdown"
+                )
+                return
+
+            agent_identifier = context.args[0]
+
+            async with async_session_maker() as db:
+                # Try to find by name first, then by UUID if it looks like one
+                from uuid import UUID as PyUUID
+                try:
+                    agent_uuid = PyUUID(agent_identifier)
+                    result = await db.execute(
+                        select(Agent).where(
+                            (Agent.name == agent_identifier) |
+                            (Agent.id == agent_uuid)
+                        )
+                    )
+                except ValueError:
+                    # Not a valid UUID, search by name only
+                    result = await db.execute(
+                        select(Agent).where(Agent.name == agent_identifier)
+                    )
+                agent = result.scalar_one_or_none()
+
+                if not agent:
+                    await update.message.reply_text(f"❌ Agent '{agent_identifier}' not found")
+                    return
+
+                # Update strategy config to enable dry_run
+                # Create a new dict to ensure SQLAlchemy detects the change
+                config = dict(agent.strategy_config or {})
+                config["dry_run"] = True
+                agent.strategy_config = config
+                from sqlalchemy.orm.attributes import flag_modified
+                flag_modified(agent, "strategy_config")
+                await db.commit()
+
+                message = (
+                    f"🟢 *DRY-RUN MODE ENABLED*\n\n"
+                    f"🤖 Agent: {agent.name}\n"
+                    f"🧪 Mode: *DRY-RUN* (simulated trades)\n\n"
+                    f"✅ Agent will log opportunities but NOT execute real trades.\n\n"
+                    f"🔄 Restart agent with `/stop_agent` then `/start_agent` to apply."
+                )
+                await update.message.reply_text(message, parse_mode="Markdown")
+
+        except Exception as e:
+            logger.error(f"Go dry error: {e}", exc_info=True)
+            await update.message.reply_text(f"❌ Error: {str(e)[:100]}")
+
+    async def agent_config(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle /agent_config command - View agent configuration."""
+        user_id = update.effective_user.id
+
+        if not await self.is_authorized(user_id):
+            await update.message.reply_text("⛔ Not authorized")
+            return
+
+        try:
+            if not context.args or len(context.args) < 1:
+                await update.message.reply_text(
+                    "❌ Usage: `/agent_config <agent_name>`\n\n"
+                    "Use /agents to see available agents.",
+                    parse_mode="Markdown"
+                )
+                return
+
+            agent_identifier = context.args[0]
+
+            async with async_session_maker() as db:
+                # Try to find by name first, then by UUID if it looks like one
+                from uuid import UUID as PyUUID
+                try:
+                    agent_uuid = PyUUID(agent_identifier)
+                    result = await db.execute(
+                        select(Agent).where(
+                            (Agent.name == agent_identifier) |
+                            (Agent.id == agent_uuid)
+                        )
+                    )
+                except ValueError:
+                    # Not a valid UUID, search by name only
+                    result = await db.execute(
+                        select(Agent).where(Agent.name == agent_identifier)
+                    )
+                agent = result.scalar_one_or_none()
+
+                if not agent:
+                    await update.message.reply_text(f"❌ Agent '{agent_identifier}' not found")
+                    return
+
+                config = agent.strategy_config or {}
+                dry_run = config.get("dry_run", True)
+                mode_emoji = "🧪" if dry_run else "🔴"
+                mode_text = "DRY-RUN" if dry_run else "LIVE"
+
+                message = (
+                    f"⚙️ *Agent Configuration*\n\n"
+                    f"🤖 *Agent:* {agent.name}\n"
+                    f"📊 *Strategy:* {agent.strategy_type}\n"
+                    f"{mode_emoji} *Mode:* {mode_text}\n"
+                    f"📈 *Status:* {agent.status}\n\n"
+                    f"*Strategy Settings:*\n"
+                    f"```\n"
+                )
+
+                for key, value in config.items():
+                    message += f"  {key}: {value}\n"
+
+                message += (
+                    f"```\n\n"
+                    f"💡 *Commands:*\n"
+                    f"  `/go_live {agent.name}` - Enable real trading\n"
+                    f"  `/go_dry {agent.name}` - Enable dry-run mode"
+                )
+
+                await update.message.reply_text(message, parse_mode="Markdown")
+
+        except Exception as e:
+            logger.error(f"Agent config error: {e}", exc_info=True)
+            await update.message.reply_text(f"❌ Error: {str(e)[:100]}")
 
     async def close_position(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle /close_position command - Close a specific position."""
@@ -1844,7 +2301,10 @@ We hope you saved your private key!
                     )
                     return
 
-                message = (
+                # Generate QR code for address
+                qr_buffer = self.generate_deposit_qr(account.address)
+
+                caption = (
                     f"💰 *Deposit Information*\n\n"
                     f"🏦 *Wallet Address:*\n`{account.address}`\n\n"
                     f"📝 *Instructions:*\n"
@@ -1855,7 +2315,11 @@ We hope you saved your private key!
                     f"🔄 Use /sync to check for deposits after sending"
                 )
 
-                await update.message.reply_text(message, parse_mode="Markdown")
+                await update.message.reply_photo(
+                    photo=InputFile(qr_buffer, filename="deposit_qr.png"),
+                    caption=caption,
+                    parse_mode="Markdown"
+                )
 
         except Exception as e:
             logger.error(f"Deposit info error: {e}", exc_info=True)
@@ -2024,8 +2488,10 @@ We hope you saved your private key!
     async def ai_chat_handler(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle all non-command messages with AI chat."""
         user_id = update.effective_user.id
+        chat_type = update.effective_chat.type
+        chat_id = update.effective_chat.id
 
-        logger.info(f"[AI Chat] Received message from user {user_id}")
+        logger.info(f"[AI Chat] Received message from user {user_id} in {chat_type}")
 
         if not await self.is_authorized(user_id):
             logger.warning(f"[AI Chat] User {user_id} not authorized")
@@ -2033,7 +2499,9 @@ We hope you saved your private key!
 
         if not config.ai.chat_enabled:
             logger.warning("[AI Chat] Feature disabled in config")
-            await update.message.reply_text("⚠️ AI chat feature is currently disabled.")
+            # Only notify in private chat
+            if chat_type == "private":
+                await update.message.reply_text("AI chat feature is currently disabled.")
             return
 
         user_message = update.message.text
@@ -2042,7 +2510,98 @@ We hope you saved your private key!
             logger.warning("[AI Chat] Empty message received")
             return
 
-        logger.info(f"[AI Chat] Processing message: {user_message[:50]}...")
+        # Handle group chats differently
+        if chat_type in ("group", "supergroup"):
+            await self._handle_group_chat(update, context, user_id, chat_id, user_message)
+        else:
+            # Private chat - always respond
+            await self._handle_private_chat(update, context, user_id, user_message)
+
+    async def _handle_group_chat(
+        self,
+        update: Update,
+        context: ContextTypes.DEFAULT_TYPE,
+        user_id: int,
+        chat_id: int,
+        user_message: str
+    ):
+        """Handle messages in group chats with smart filtering."""
+        try:
+            # Get bot username
+            bot_user = await self.application.bot.get_me()
+            bot_username = bot_user.username or "void_bot"
+
+            # Check if this is a reply to the bot's message
+            is_reply_to_bot = False
+            if update.message.reply_to_message:
+                reply_from = update.message.reply_to_message.from_user
+                if reply_from and reply_from.id == bot_user.id:
+                    is_reply_to_bot = True
+
+            # Get recent chat context from context.chat_data
+            chat_context = context.chat_data.get("recent_messages", "")
+
+            # Store this message in context for future reference
+            username = update.effective_user.username or update.effective_user.first_name or "anon"
+            new_context = f"@{username}: {user_message}\n"
+            context.chat_data["recent_messages"] = (chat_context + new_context)[-2000:]  # Keep last 2000 chars
+
+            async with async_session_maker() as db:
+                chat_service = ChatService(db)
+
+                # Check if bot should respond
+                should_respond, reason = await chat_service.should_respond_in_group(
+                    message=user_message,
+                    bot_username=bot_username,
+                    is_reply_to_bot=is_reply_to_bot,
+                    chat_context=chat_context,
+                )
+
+                logger.info(
+                    f"[Group Chat] should_respond={should_respond}, reason={reason}, "
+                    f"message={user_message[:50]}..."
+                )
+
+                if not should_respond:
+                    return  # Silently ignore
+
+                # Send typing action
+                await update.message.chat.send_action("typing")
+
+                # Get AI response using group chat mode
+                response = await chat_service.group_chat(
+                    user_id=user_id,
+                    username=username,
+                    message=user_message,
+                    chat_id=chat_id,
+                    chat_context=chat_context,
+                )
+
+                # Truncate if needed
+                if len(response) > 4000:
+                    response = response[:3997] + "..."
+
+                # Reply to the message
+                await update.message.reply_text(response)
+
+                # Store bot response in context
+                context.chat_data["recent_messages"] = (
+                    context.chat_data.get("recent_messages", "") + f"VOID: {response}\n"
+                )[-2000:]
+
+        except Exception as e:
+            logger.error(f"[Group Chat] Error: {e}", exc_info=True)
+            # Don't spam error messages in group
+
+    async def _handle_private_chat(
+        self,
+        update: Update,
+        context: ContextTypes.DEFAULT_TYPE,
+        user_id: int,
+        user_message: str
+    ):
+        """Handle messages in private chats."""
+        logger.info(f"[AI Chat] Processing private message: {user_message[:50]}...")
 
         try:
             async with async_session_maker() as db:
@@ -2051,26 +2610,37 @@ We hope you saved your private key!
                 # Send typing action
                 await update.message.chat.send_action("typing")
 
+                # Check for URLs in message - fetch and include content
+                import re
+                urls = re.findall(r'https?://[^\s]+', user_message)
+                url_context = ""
+                if urls:
+                    for url in urls[:2]:  # Max 2 URLs
+                        content = await chat_service.fetch_url_content(url)
+                        if content:
+                            url_context += f"\n[Content from {url[:50]}]: {content}\n"
+
+                # Append URL context to message if found
+                full_message = user_message
+                if url_context:
+                    full_message = f"{user_message}\n\n---\nURL Contents:{url_context}"
+
                 # Get AI response
-                logger.info("[AI Chat] Calling chat service...")
-                response = await chat_service.chat(user_id, user_message)
+                response = await chat_service.chat(user_id, full_message)
 
                 logger.info(f"[AI Chat] Got response: {response[:100]}...")
 
-                # Send response (truncate if too long for Telegram)
-                max_length = 4000  # Telegram message limit
-                if len(response) > max_length:
-                    response = response[:max_length-3] + "..."
-                    logger.warning(f"[AI Chat] Response truncated to {max_length} chars")
+                # Truncate if needed
+                if len(response) > 4000:
+                    response = response[:3997] + "..."
 
-                # Send as plain text to avoid Markdown parsing errors with AI-generated content
                 await update.message.reply_text(response)
                 logger.info("[AI Chat] Response sent successfully")
 
         except Exception as e:
             logger.error(f"[AI Chat] Error: {e}", exc_info=True)
             await update.message.reply_text(
-                f"⚠️ Sorry, I encountered an error: {str(e)[:100]}"
+                f"something went wrong, try again in a sec"
             )
 
     async def ask_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2308,6 +2878,9 @@ We hope you saved your private key!
         self.application.add_handler(CommandHandler("start_agent", self.start_agent))
         self.application.add_handler(CommandHandler("stop_agent", self.stop_agent))
         self.application.add_handler(CommandHandler("delete_agent", self.delete_agent))
+        self.application.add_handler(CommandHandler("go_live", self.go_live))
+        self.application.add_handler(CommandHandler("go_dry", self.go_dry))
+        self.application.add_handler(CommandHandler("agent_config", self.agent_config))
         self.application.add_handler(CommandHandler("close_position", self.close_position))
         self.application.add_handler(CommandHandler("deposit", self.deposit))
         self.application.add_handler(CommandHandler("withdraw", self.withdraw))
@@ -2380,10 +2953,267 @@ We hope you saved your private key!
         logger.info("🔄 Starting background task scheduler...")
         await self.scheduler.start()
 
+        # Auto-resume agents that were running before bot restart
+        await self._resume_running_agents()
+
         logger.info("🤖 VOID Bot started polling")
+
+    async def _resume_running_agents(self):
+        """Resume agents that were marked as RUNNING in the database."""
+        try:
+            async with async_session_maker() as db:
+                # Find all agents with RUNNING status
+                result = await db.execute(
+                    select(Agent).where(Agent.status == AgentStatus.RUNNING)
+                )
+                running_agents = result.scalars().all()
+
+                if not running_agents:
+                    logger.info("🤖 No agents to resume")
+                    return
+
+                logger.info(f"🤖 Found {len(running_agents)} agents to resume")
+
+                for agent in running_agents:
+                    try:
+                        agent_id_str = str(agent.id)
+                        if agent_id_str in self._running_agents:
+                            continue  # Already running
+
+                        # Create and start the agent scan loop
+                        task = asyncio.create_task(
+                            self._create_agent_scan_loop(agent.id, agent.name, agent.telegram_user_id)
+                        )
+                        self._running_agents[agent_id_str] = {
+                            "task": task,
+                            "name": agent.name,
+                            "started_at": datetime.utcnow()
+                        }
+                        logger.info(f"🤖 Resumed agent: {agent.name}")
+                    except Exception as e:
+                        logger.error(f"Failed to resume agent {agent.name}: {e}")
+
+        except Exception as e:
+            logger.error(f"Error resuming agents: {e}")
+
+    async def _create_agent_scan_loop(self, agent_id: int, agent_name: str, user_id: int):
+        """
+        Background task that runs the full oracle latency trading pipeline.
+
+        Pipeline steps:
+        1. Fetch markets from Polymarket Gamma API
+        2. Convert to Market models
+        3. Scan for oracle latency opportunities using strategy
+        4. Verify signals with AI (Z.ai GLM-4.7)
+        5. Execute trades (or log in dry-run mode)
+        6. Persist signals and orders to database
+        """
+        agent_id_str = str(agent_id)
+        try:
+            logger.info(f"[Agent] Starting full trading pipeline for {agent_name}")
+
+            while agent_id_str in self._running_agents:
+                try:
+                    async with async_session_maker() as db:
+                        from void.data.feeds.polymarket import GammaClient
+                        from void.strategies.oracle_latency import OracleLatencyStrategy, OracleLatencyConfig
+                        from void.strategies.base import StrategyContext
+                        from void.data.models import Signal, SignalStatus
+                        from decimal import Decimal
+
+                        # Get fresh agent data
+                        result = await db.execute(
+                            select(Agent).where(Agent.id == agent_id)
+                        )
+                        agent = result.scalar_one_or_none()
+
+                        if not agent or agent.status != AgentStatus.RUNNING:
+                            logger.info(f"[Agent] {agent_name} stopped or not found")
+                            break
+
+                        # Get agent config
+                        strategy_config = agent.strategy_config or {}
+                        dry_run = strategy_config.get("dry_run", True)  # Default to dry-run for safety
+
+                        # Initialize strategy with config
+                        config = OracleLatencyConfig(**strategy_config)
+                        strategy = OracleLatencyStrategy(config)
+                        await strategy.start()
+
+                        # Fetch markets from Polymarket
+                        gamma = GammaClient()
+                        logger.info(f"[Agent] {agent_name} fetching markets from Polymarket...")
+
+                        markets_data = await gamma.get_markets(
+                            active=True,
+                            closed=True,  # Include closed but not resolved markets
+                            limit=100,
+                            min_liquidity=float(config.min_liquidity_usd),
+                        )
+
+                        # Convert to Market models and build cache
+                        markets = []
+                        market_cache = {}
+                        for market_data in markets_data:
+                            try:
+                                market = gamma.to_market_model(market_data)
+                                markets.append(market)
+                                market_cache[market.id] = market
+                            except Exception as e:
+                                logger.debug(f"[Agent] Failed to parse market: {e}")
+
+                        logger.info(f"[Agent] {agent_name} parsed {len(markets)} markets")
+
+                        # Build strategy context
+                        context = StrategyContext(
+                            agent_id=agent.id,
+                            account_id=agent.account_id,
+                            config=config,
+                            active_positions=[],
+                            pending_orders=[],
+                            recent_signals=[],
+                            market_cache=market_cache,
+                        )
+
+                        # Scan for signals
+                        signals_detected = 0
+                        signals_verified = 0
+                        signals_executed = 0
+
+                        async for signal in strategy.scan_markets(markets, context):
+                            signals_detected += 1
+
+                            # Persist signal to database
+                            db.add(signal)
+                            await db.flush()
+
+                            logger.info(
+                                f"[Agent] Signal detected: {signal.predicted_outcome} "
+                                f"on market {signal.market_id[:20]}... @ ${float(signal.entry_price):.3f} "
+                                f"(margin: {float(signal.profit_margin)*100:.1f}%)"
+                            )
+
+                            # Verify signal with AI
+                            verified_signal = await strategy.verify_signal(signal, context)
+
+                            if verified_signal.status == SignalStatus.VERIFIED:
+                                signals_verified += 1
+
+                                logger.info(
+                                    f"[Agent] Signal VERIFIED with {float(verified_signal.confidence)*100:.0f}% confidence "
+                                    f"(source: {verified_signal.verification_source})"
+                                )
+
+                                # Execute trade (or simulate in dry-run)
+                                if dry_run:
+                                    logger.info(
+                                        f"[Agent] DRY-RUN: Would buy {verified_signal.predicted_outcome} "
+                                        f"@ ${float(verified_signal.entry_price):.3f}"
+                                    )
+                                    verified_signal.status = SignalStatus.EXECUTED
+                                    verified_signal.executed_at = datetime.utcnow()
+                                    signals_executed += 1
+                                else:
+                                    # Generate and execute orders
+                                    order_requests = await strategy.generate_orders(verified_signal, context)
+
+                                    for order_request in order_requests:
+                                        try:
+                                            from void.execution.models import OrderRequest, OrderSide, OrderType
+                                            from void.execution.engine import ExecutionEngine
+                                            from void.accounts.service import AccountService
+
+                                            # Create execution engine
+                                            account_service = AccountService(db)
+                                            execution_engine = ExecutionEngine(db, account_service)
+
+                                            # Build order request
+                                            exec_request = OrderRequest(
+                                                market_id=order_request["market_id"],
+                                                token_id=order_request["token_id"],
+                                                side=OrderSide[order_request["side"].upper()],
+                                                order_type=OrderType[order_request["order_type"]],
+                                                price=Decimal(str(order_request["price"])),
+                                                size=Decimal(str(order_request["size"])),
+                                                signal_id=signal.id,
+                                            )
+
+                                            # Execute order
+                                            result = await execution_engine.execute_order(
+                                                exec_request,
+                                                agent.account_id
+                                            )
+
+                                            if result.success:
+                                                logger.info(
+                                                    f"[Agent] ORDER EXECUTED: {result.clob_order_id} "
+                                                    f"(latency: {result.latency_ms}ms)"
+                                                )
+                                                verified_signal.status = SignalStatus.EXECUTED
+                                                verified_signal.executed_at = datetime.utcnow()
+                                                signals_executed += 1
+                                            else:
+                                                logger.error(
+                                                    f"[Agent] Order failed: {result.error}"
+                                                )
+
+                                        except Exception as e:
+                                            logger.error(f"[Agent] Execution error: {e}")
+
+                            else:
+                                logger.info(
+                                    f"[Agent] Signal rejected: {verified_signal.status.value} "
+                                    f"(confidence: {float(verified_signal.confidence)*100:.0f}%)"
+                                )
+
+                            # Save signal updates
+                            await db.commit()
+
+                        # Update heartbeat
+                        agent.last_heartbeat = datetime.utcnow()
+                        await db.commit()
+
+                        # Close gamma client session
+                        await gamma.close()
+
+                        logger.info(
+                            f"[Agent] {agent_name} scan complete | "
+                            f"Markets: {len(markets)} | "
+                            f"Detected: {signals_detected} | "
+                            f"Verified: {signals_verified} | "
+                            f"Executed: {signals_executed}"
+                        )
+
+                    # Wait before next scan
+                    scan_interval = strategy_config.get("scan_interval_seconds", 30)
+                    await asyncio.sleep(scan_interval)
+
+                except asyncio.CancelledError:
+                    logger.info(f"[Agent] {agent_name} scan loop cancelled")
+                    break
+                except Exception as e:
+                    logger.error(f"[Agent] {agent_name} scan error: {e}", exc_info=True)
+                    await asyncio.sleep(60)  # Wait longer on error
+
+        except Exception as e:
+            logger.error(f"[Agent] {agent_name} loop crashed: {e}", exc_info=True)
+        finally:
+            # Clean up
+            if agent_id_str in self._running_agents:
+                del self._running_agents[agent_id_str]
+            logger.info(f"[Agent] {agent_name} loop ended")
 
     async def stop(self):
         """Stop bot."""
+        # Stop running agents
+        for agent_id_str, agent_info in list(self._running_agents.items()):
+            try:
+                agent_info["task"].cancel()
+                logger.info(f"Stopped agent: {agent_info['name']}")
+            except Exception as e:
+                logger.error(f"Error stopping agent: {e}")
+        self._running_agents.clear()
+
         # Stop background scheduler first
         logger.info("🔄 Stopping background task scheduler...")
         await self.scheduler.stop()

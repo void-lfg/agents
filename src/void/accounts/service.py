@@ -34,6 +34,7 @@ class AccountService:
     async def create_account(
         self,
         name: str,
+        telegram_user_id: int,
         private_key: Optional[str] = None,
     ) -> Account:
         """
@@ -41,15 +42,23 @@ class AccountService:
 
         Args:
             name: Account name
+            telegram_user_id: Telegram user ID who owns this account
             private_key: Optional private key (generated if not provided)
 
         Returns:
             Created account
         """
-        # Check if name already exists
-        existing = await self.repo.get_by_name(name)
+        # Check if name already exists for this user
+        from sqlalchemy import select
+        result = await self.db.execute(
+            select(Account).where(
+                Account.telegram_user_id == telegram_user_id,
+                Account.name == name
+            )
+        )
+        existing = result.scalar_one_or_none()
         if existing:
-            raise ValueError(f"Account with name '{name}' already exists")
+            raise ValueError(f"Account with name '{name}' already exists for this user")
 
         # Generate or use provided private key
         if not private_key:
@@ -63,6 +72,7 @@ class AccountService:
 
         # Create account
         account = Account(
+            telegram_user_id=telegram_user_id,
             name=name,
             address=address,
             encrypted_private_key=encrypted_key,
@@ -78,6 +88,7 @@ class AccountService:
         logger.info(
             "account_created",
             account_id=str(account.id),
+            telegram_user_id=telegram_user_id,
             name=name,
             address=address,
         )
